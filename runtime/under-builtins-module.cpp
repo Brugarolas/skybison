@@ -26,6 +26,7 @@
 #include "mro.h"
 #include "object-builtins.h"
 #include "range-builtins.h"
+#include "set-builtins.h"
 #include "slice-builtins.h"
 #include "str-builtins.h"
 #include "strarray-builtins.h"
@@ -4314,6 +4315,79 @@ RawObject FUNC(_builtins, _range_check)(Thread*, Arguments args) {
   return Bool::fromBool(args.get(0).isRange());
 }
 
+RawObject FUNC(_builtins, _range_ctor_start_stop)(Thread* thread,
+                                                  Arguments args) {
+  Runtime* runtime = thread->runtime();
+  DCHECK(args.get(0) == runtime->typeAt(LayoutId::kRange), "unexpected cls");
+  HandleScope scope(thread);
+  Object start(&scope, args.get(1));
+  if (!start.isSmallInt()) {
+    start = intFromIndex(thread, start);
+    if (start.isError()) {
+      return *start;
+    }
+  }
+  Object stop(&scope, args.get(2));
+  if (!stop.isSmallInt()) {
+    stop = intFromIndex(thread, stop);
+    if (stop.isError()) {
+      return *stop;
+    }
+  }
+  Object step(&scope, SmallInt::fromWord(1));
+  return runtime->newRange(start, stop, step);
+}
+
+RawObject FUNC(_builtins, _range_ctor_start_stop_step)(Thread* thread,
+                                                       Arguments args) {
+  Runtime* runtime = thread->runtime();
+  DCHECK(args.get(0) == runtime->typeAt(LayoutId::kRange), "unexpected cls");
+  HandleScope scope(thread);
+  Object start(&scope, args.get(1));
+  if (!start.isSmallInt()) {
+    start = intFromIndex(thread, start);
+    if (start.isError()) {
+      return *start;
+    }
+  }
+  Object stop(&scope, args.get(2));
+  if (!stop.isSmallInt()) {
+    stop = intFromIndex(thread, stop);
+    if (stop.isError()) {
+      return *stop;
+    }
+  }
+  Object step(&scope, args.get(3));
+  if (!step.isSmallInt()) {
+    step = intFromIndex(thread, step);
+    if (step.isError()) {
+      return *step;
+    }
+  }
+  Int step_int(&scope, intUnderlying(*step));
+  if (step_int.isZero()) {
+    return thread->raiseWithFmt(LayoutId::kValueError,
+                                "range() arg 3 must not be zero");
+  }
+  return runtime->newRange(start, stop, step);
+}
+
+RawObject FUNC(_builtins, _range_ctor_stop)(Thread* thread, Arguments args) {
+  Runtime* runtime = thread->runtime();
+  DCHECK(args.get(0) == runtime->typeAt(LayoutId::kRange), "unexpected cls");
+  HandleScope scope(thread);
+  Object start(&scope, SmallInt::fromWord(0));
+  Object stop(&scope, args.get(1));
+  if (!stop.isSmallInt()) {
+    stop = intFromIndex(thread, stop);
+    if (stop.isError()) {
+      return *stop;
+    }
+  }
+  Object step(&scope, SmallInt::fromWord(1));
+  return runtime->newRange(start, stop, step);
+}
+
 RawObject FUNC(_builtins, _range_guard)(Thread* thread, Arguments args) {
   if (args.get(0).isRange()) {
     return NoneType::object();
@@ -4425,6 +4499,19 @@ RawObject FUNC(_builtins,
   function.setCode(*new_code);
   function.setFlags(function.flags() | Function::Flags::kIterableCoroutine);
   return NoneType::object();
+}
+
+RawObject FUNC(_builtins, _set_ctor)(Thread* thread, Arguments args) {
+  Runtime* runtime = thread->runtime();
+  DCHECK(args.get(0) == runtime->typeAt(LayoutId::kSet), "unexpected cls");
+  RawObject iterable_raw = args.get(1);
+  if (iterable_raw == runtime->emptyTuple()) {
+    return runtime->newSet();
+  }
+  HandleScope scope(thread);
+  Object iterable(&scope, iterable_raw);
+  Set self(&scope, runtime->newSet());
+  return setUpdate(thread, self, iterable);
 }
 
 RawObject FUNC(_builtins, _set_guard)(Thread* thread, Arguments args) {
@@ -4554,6 +4641,21 @@ RawObject FUNC(_builtins, _slice_start_long)(Thread* thread, Arguments args) {
     start = *upper;
   }
   return *start;
+}
+
+bool FUNC(_builtins, _slice_step_intrinsic)(Thread* thread) {
+  RawObject step_obj = thread->stackTop();
+  if (step_obj.isNoneType()) {
+    thread->stackPop();
+    thread->stackSetTop(SmallInt::fromWord(1));
+    return true;
+  }
+  if (step_obj.isSmallInt()) {
+    thread->stackPop();
+    thread->stackSetTop(step_obj);
+    return true;
+  }
+  return false;
 }
 
 RawObject FUNC(_builtins, _slice_step)(Thread* thread, Arguments args) {
@@ -4744,6 +4846,7 @@ RawObject FUNC(_builtins, _structseq_new_type)(Thread* thread, Arguments args) {
                              : SmallInt::cast(args.get(3)).value();
   word flags =
       is_heaptype.value() ? Type::Flag::kIsCPythonHeaptype : Type::Flag::kNone;
+  flags |= Type::Flag::kIsStructseq;
   return structseqNewType(thread, name, field_names, num_in_sequence, flags);
 }
 

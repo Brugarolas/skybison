@@ -120,6 +120,44 @@ void icUpdateAttrModule(Thread* thread, const MutableTuple& caches, word cache,
   icInsertDependentToValueCellDependencyLink(thread, dependent, value_cell);
 }
 
+void icUpdateMethodModule(Thread* thread, const MutableTuple& caches,
+                          word cache, const Object& receiver,
+                          const ValueCell& value_cell,
+                          const Function& dependent) {
+  DCHECK(icIsCacheEmpty(caches, cache), "cache must be empty\n");
+  HandleScope scope(thread);
+  word index = cache * kIcPointersPerEntry;
+  Module module(&scope, *receiver);
+  caches.atPut(index + kIcEntryKeyOffset, SmallInt::fromWord(module.id()));
+  caches.atPut(index + kIcEntryValueOffset, *value_cell);
+  RawMutableBytes bytecode =
+      RawMutableBytes::cast(dependent.rewrittenBytecode());
+  word pc = thread->currentFrame()->virtualPC() - kCodeUnitSize;
+  DCHECK(bytecode.byteAt(pc) == LOAD_METHOD_ANAMORPHIC,
+         "current opcode must be LOAD_METHOD_ANAMORPHIC");
+  bytecode.byteAtPut(pc, LOAD_METHOD_MODULE);
+  icInsertDependentToValueCellDependencyLink(thread, dependent, value_cell);
+}
+
+void icUpdateMethodType(Thread* thread, const MutableTuple& caches, word cache,
+                        const Object& receiver, const ValueCell& value_cell,
+                        const Function& dependent) {
+  DCHECK(icIsCacheEmpty(caches, cache), "cache must be empty\n");
+  HandleScope scope(thread);
+  word index = cache * kIcPointersPerEntry;
+  Type type(&scope, *receiver);
+  caches.atPut(index + kIcEntryKeyOffset,
+               SmallInt::fromWord(static_cast<word>(type.instanceLayoutId())));
+  caches.atPut(index + kIcEntryValueOffset, *value_cell);
+  RawMutableBytes bytecode =
+      RawMutableBytes::cast(dependent.rewrittenBytecode());
+  word pc = thread->currentFrame()->virtualPC() - kCodeUnitSize;
+  DCHECK(bytecode.byteAt(pc) == LOAD_METHOD_ANAMORPHIC,
+         "current opcode must be LOAD_METHOD_ANAMORPHIC");
+  bytecode.byteAtPut(pc, LOAD_METHOD_TYPE);
+  icInsertDependentToValueCellDependencyLink(thread, dependent, value_cell);
+}
+
 void icUpdateAttrType(Thread* thread, const MutableTuple& caches, word cache,
                       const Object& receiver, const Object& selector,
                       const Object& value, const Function& dependent) {
@@ -161,11 +199,6 @@ void icUpdateCallFunctionTypeNew(Thread* thread, const MutableTuple& caches,
   word id = static_cast<word>(type.instanceLayoutId());
   caches.atPut(index + kIcEntryKeyOffset, SmallInt::fromWord(id));
   caches.atPut(index + kIcEntryValueOffset, *constructor);
-  MutableBytes bytecode(&scope, dependent.rewrittenBytecode());
-  word pc = thread->currentFrame()->virtualPC() - kCodeUnitSize;
-  DCHECK(bytecode.byteAt(pc) == CALL_FUNCTION_ANAMORPHIC,
-         "current opcode must be CALL_FUNCTION_ANAMORPHIC");
-  bytecode.byteAtPut(pc, CALL_FUNCTION_TYPE_NEW);
   if (!type.isBuiltin()) {
     icInsertConstructorDependencies(thread, static_cast<LayoutId>(id),
                                     dependent);
@@ -827,6 +860,15 @@ void icInvalidateGlobalVar(Thread* thread, const ValueCell& value_cell) {
           }
           break;
         }
+        case LOAD_METHOD_MODULE: {
+          original_bc = LOAD_METHOD_ANAMORPHIC;
+          word index = op.cache * kIcPointersPerEntry;
+          if (caches.at(index + kIcEntryValueOffset) == *value_cell) {
+            caches.atPut(index + kIcEntryKeyOffset, NoneType::object());
+            caches.atPut(index + kIcEntryValueOffset, NoneType::object());
+          }
+          break;
+        }
         case LOAD_GLOBAL_CACHED:
           original_bc = LOAD_GLOBAL;
           if (op.bc != original_bc && op.arg == name_index_found) {
@@ -859,6 +901,9 @@ bool IcIterator::isAttrNameEqualTo(const Object& attr_name) const {
     case BINARY_SUBSCR_MONOMORPHIC:
     case BINARY_SUBSCR_POLYMORPHIC:
       return attr_name == runtime_->symbols()->at(ID(__getitem__));
+    case CALL_FUNCTION_TYPE_INIT:
+      return attr_name == runtime_->symbols()->at(ID(__new__)) ||
+             attr_name == runtime_->symbols()->at(ID(__init__));
     case CALL_FUNCTION_TYPE_NEW:
       return attr_name == runtime_->symbols()->at(ID(__new__)) ||
              attr_name == runtime_->symbols()->at(ID(__init__));

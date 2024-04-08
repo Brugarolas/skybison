@@ -669,6 +669,17 @@ TEST_F(InterpreterTest, DoBinaryOpWithSmallIntsRewritesOpcode) {
       isIntEqualsWord(Interpreter::call0(thread_, function), left - right));
 }
 
+static bool functionMatchesRef1(const Function& function,
+                                const Object& reference, const Object& arg0) {
+  Thread* thread = Thread::current();
+  HandleScope scope(thread);
+  Object expected(&scope, Interpreter::call1(thread, reference, arg0));
+  EXPECT_FALSE(expected.isError());
+  Object actual(&scope, Interpreter::call1(thread, function, arg0));
+  EXPECT_FALSE(actual.isError());
+  return Runtime::objectEquals(thread, *expected, *actual) == Bool::trueObj();
+}
+
 static bool functionMatchesRef2(const Function& function,
                                 const Object& reference, const Object& arg0,
                                 const Object& arg1) {
@@ -771,6 +782,8 @@ TEST_F(InterpreterTest,
   HandleScope scope(thread_);
   ASSERT_FALSE(runFromCStr(runtime_, R"(
 class C:
+  def __new__(cls):
+    return object.__new__(cls)
   def __init__(self):
     pass
 def foo(fn):
@@ -790,13 +803,149 @@ def new_init(self):
 
   // Invalidate cache
   Object new_init(&scope, mainModuleAt(runtime_, "new_init"));
-  typeAtPutById(thread_, type, ID(__new__), new_init);
+  typeAtPutById(thread_, type, ID(__init__), new_init);
 
   // Cache miss
   expected = Interpreter::call1(thread_, function, type);
   EXPECT_FALSE(expected.isError());
   EXPECT_EQ(expected.layoutId(), type.instanceLayoutId());
   EXPECT_TRUE(containsBytecode(function, CALL_FUNCTION));
+}
+
+TEST_F(InterpreterTest, CallFunctionAnamorphicRewritesToCallFunctionTypeInit) {
+  HandleScope scope(thread_);
+  ASSERT_FALSE(runFromCStr(runtime_, R"(
+class C:
+  def __init__(self):
+    pass
+def foo(fn):
+  return fn()
+def non_type():
+  return 5
+)")
+                   .isError());
+  Function function(&scope, mainModuleAt(runtime_, "foo"));
+  EXPECT_TRUE(containsBytecode(function, CALL_FUNCTION_ANAMORPHIC));
+
+  Type type(&scope, mainModuleAt(runtime_, "C"));
+  Object expected(&scope, Interpreter::call1(thread_, function, type));
+  EXPECT_FALSE(expected.isError());
+  EXPECT_TRUE(containsBytecode(function, CALL_FUNCTION_TYPE_INIT));
+  EXPECT_EQ(expected.layoutId(), type.instanceLayoutId());
+
+  Object non_type(&scope, mainModuleAt(runtime_, "non_type"));
+  expected = Interpreter::call1(thread_, function, non_type);
+  EXPECT_FALSE(expected.isError());
+  EXPECT_TRUE(isIntEqualsWord(*expected, 5));
+  EXPECT_TRUE(containsBytecode(function, CALL_FUNCTION));
+}
+
+TEST_F(InterpreterTest,
+       CallFunctionTypeInitWithNewDunderInitRewritesToCallFunction) {
+  HandleScope scope(thread_);
+  ASSERT_FALSE(runFromCStr(runtime_, R"(
+class C:
+  def __init__(self):
+    pass
+def foo(fn):
+  return fn()
+def new_init(self):
+  pass
+)")
+                   .isError());
+  Function function(&scope, mainModuleAt(runtime_, "foo"));
+  EXPECT_TRUE(containsBytecode(function, CALL_FUNCTION_ANAMORPHIC));
+
+  Type type(&scope, mainModuleAt(runtime_, "C"));
+  Object expected(&scope, Interpreter::call1(thread_, function, type));
+  EXPECT_FALSE(expected.isError());
+  EXPECT_TRUE(containsBytecode(function, CALL_FUNCTION_TYPE_INIT));
+  EXPECT_EQ(expected.layoutId(), type.instanceLayoutId());
+
+  // Invalidate cache
+  Object new_init(&scope, mainModuleAt(runtime_, "new_init"));
+  typeAtPutById(thread_, type, ID(__init__), new_init);
+
+  // Cache miss
+  expected = Interpreter::call1(thread_, function, type);
+  EXPECT_FALSE(expected.isError());
+  EXPECT_EQ(expected.layoutId(), type.instanceLayoutId());
+  EXPECT_TRUE(containsBytecode(function, CALL_FUNCTION));
+}
+
+TEST_F(InterpreterTest,
+       CallFunctionTypeInitWithNewDunderNewRewritesToCallFunction) {
+  HandleScope scope(thread_);
+  ASSERT_FALSE(runFromCStr(runtime_, R"(
+class C:
+  def __init__(self):
+    pass
+def foo(fn):
+  return fn()
+def new_new(self):
+  pass
+)")
+                   .isError());
+  Function function(&scope, mainModuleAt(runtime_, "foo"));
+  EXPECT_TRUE(containsBytecode(function, CALL_FUNCTION_ANAMORPHIC));
+
+  Type type(&scope, mainModuleAt(runtime_, "C"));
+  Object expected(&scope, Interpreter::call1(thread_, function, type));
+  EXPECT_FALSE(expected.isError());
+  EXPECT_TRUE(containsBytecode(function, CALL_FUNCTION_TYPE_INIT));
+  EXPECT_EQ(expected.layoutId(), type.instanceLayoutId());
+
+  // Invalidate cache
+  Object new_new(&scope, mainModuleAt(runtime_, "new_new"));
+  typeAtPutById(thread_, type, ID(__new__), new_new);
+
+  // Cache miss
+  expected = Interpreter::call1(thread_, function, type);
+  EXPECT_FALSE(expected.isError());
+  EXPECT_EQ(expected.layoutId(), type.instanceLayoutId());
+  EXPECT_TRUE(containsBytecode(function, CALL_FUNCTION));
+}
+
+// Test that `function(arg0) == reference(arg0)` with the assumption
+// that `function` contains the original unary opcode that will be
+// specialized to `opcode_specialized` when called with `arg0`.
+// Calling the function with `arg_o` should trigger a revert to
+// the unspecialized unary op.
+static void testUnaryOpRewrite(const Function& function,
+                               const Function& reference,
+                               Bytecode opcode_unspecialized,
+                               Bytecode opcode_specialized, const Object& arg0,
+                               const Object& arg_o) {
+  EXPECT_TRUE(containsBytecode(function, UNARY_OP_ANAMORPHIC));
+
+  EXPECT_TRUE(functionMatchesRef1(function, reference, arg0));
+  EXPECT_FALSE(containsBytecode(function, BINARY_OP_ANAMORPHIC));
+  EXPECT_TRUE(containsBytecode(function, opcode_specialized));
+  EXPECT_TRUE(functionMatchesRef1(function, reference, arg0));
+  EXPECT_TRUE(containsBytecode(function, opcode_specialized));
+
+  EXPECT_TRUE(functionMatchesRef1(function, reference, arg_o));
+  EXPECT_TRUE(containsBytecode(function, opcode_unspecialized));
+  EXPECT_FALSE(containsBytecode(function, opcode_specialized));
+
+  EXPECT_TRUE(functionMatchesRef1(function, reference, arg0));
+}
+
+TEST_F(InterpreterTest, UnaryOpAnamorphicRewritesToUnaryNegativeSmallInt) {
+  HandleScope scope(thread_);
+  ASSERT_FALSE(runFromCStr(runtime_, R"(
+def function(obj):
+    return -obj
+reference = int.__neg__
+)")
+                   .isError());
+  Function function(&scope, mainModuleAt(runtime_, "function"));
+  Function reference(&scope, mainModuleAt(runtime_, "reference"));
+  Object arg0(&scope, SmallInt::fromWord(34));
+  const uword digits2[] = {0x12345678, 0xabcdef};
+  Object arg_l(&scope, runtime_->newLargeIntWithDigits(digits2));
+  testUnaryOpRewrite(function, reference, UNARY_NEGATIVE,
+                     UNARY_NEGATIVE_SMALLINT, arg0, arg_l);
 }
 
 TEST_F(InterpreterTest, BinaryOpAnamorphicRewritesToBinaryAddSmallInt) {
@@ -1772,11 +1921,11 @@ def foo(a, b):
 TEST_F(InterpreterDeathTest, InvalidOpcode) {
   HandleScope scope(thread_);
 
-  const byte bytecode[] = {NOP, 0, NOP, 0, UNUSED_BYTECODE_7, 17, NOP, 7};
+  const byte bytecode[] = {NOP, 0, NOP, 0, UNUSED_BYTECODE_0, 17, NOP, 7};
   Code code(&scope, newCodeWithBytes(bytecode));
 
   ASSERT_DEATH(static_cast<void>(runCode(code)),
-               "bytecode 'UNUSED_BYTECODE_7'");
+               "bytecode 'UNUSED_BYTECODE_0'");
 }
 
 TEST_F(InterpreterTest, CallDescriptorGetWithBuiltinTypeDescriptors) {
@@ -3371,6 +3520,82 @@ l = (1, 2, 3, 4)
 a, b, c = l
 )";
   EXPECT_TRUE(raisedWithStr(runFromCStr(runtime_, src), LayoutId::kValueError,
+                            "too many values to unpack"));
+}
+
+TEST_F(InterpreterTest, UnpackSequenceWithStructseq) {
+  ASSERT_FALSE(runFromCStr(runtime_, R"(
+from _builtins import _structseq_new_type
+C = _structseq_new_type("C", ("a", "b", "c"))
+obj = C((1,2,3))
+a, b, c = obj
+)")
+                   .isError());
+  HandleScope scope(thread_);
+  Object a(&scope, mainModuleAt(runtime_, "a"));
+  Object b(&scope, mainModuleAt(runtime_, "b"));
+  Object c(&scope, mainModuleAt(runtime_, "c"));
+  EXPECT_TRUE(isIntEqualsWord(*a, 1));
+  EXPECT_TRUE(isIntEqualsWord(*b, 2));
+  EXPECT_TRUE(isIntEqualsWord(*c, 3));
+}
+
+TEST_F(InterpreterTest, UnpackSequenceWithStructseqTooFewObjects) {
+  EXPECT_TRUE(raisedWithStr(runFromCStr(runtime_, R"(
+from _builtins import _structseq_new_type
+C = _structseq_new_type("C", ("a", "b"))
+obj = C((1,2))
+a, b, c = obj
+)"),
+                            LayoutId::kValueError,
+                            "not enough values to unpack"));
+}
+
+TEST_F(InterpreterTest, UnpackSequenceWithStructseqTooManyObjects) {
+  EXPECT_TRUE(raisedWithStr(runFromCStr(runtime_, R"(
+from _builtins import _structseq_new_type
+C = _structseq_new_type("C", ("a", "b", "c"))
+obj = C((1,2,3))
+a, b = obj
+)"),
+                            LayoutId::kValueError,
+                            "too many values to unpack"));
+}
+
+TEST_F(InterpreterTest, UnpackSequenceWithStructseqInObj) {
+  ASSERT_FALSE(runFromCStr(runtime_, R"(
+from _builtins import _structseq_new_type
+C = _structseq_new_type("C", ("a", "b", "c"), num_in_sequence=2)
+obj = C((1,2,3))
+a, b = obj
+)")
+                   .isError());
+  HandleScope scope(thread_);
+  Object a(&scope, mainModuleAt(runtime_, "a"));
+  Object b(&scope, mainModuleAt(runtime_, "b"));
+  EXPECT_TRUE(isIntEqualsWord(*a, 1));
+  EXPECT_TRUE(isIntEqualsWord(*b, 2));
+}
+
+TEST_F(InterpreterTest, UnpackSequenceWithStructseqTooFewObjectsInSeq) {
+  EXPECT_TRUE(raisedWithStr(runFromCStr(runtime_, R"(
+from _builtins import _structseq_new_type
+C = _structseq_new_type("C", ("a", "b", "c"), num_in_sequence=2)
+obj = C((1,2,3))
+a, b, c = obj
+)"),
+                            LayoutId::kValueError,
+                            "not enough values to unpack"));
+}
+
+TEST_F(InterpreterTest, UnpackSequenceWithStructseqTooManyObjectsInSeq) {
+  EXPECT_TRUE(raisedWithStr(runFromCStr(runtime_, R"(
+from _builtins import _structseq_new_type
+C = _structseq_new_type("C", ("a", "b", "c", "d"), num_in_sequence=3)
+obj = C((1,2,3,4))
+a, b = obj
+)"),
+                            LayoutId::kValueError,
                             "too many values to unpack"));
 }
 
@@ -6512,6 +6737,365 @@ c = C()
   EXPECT_TRUE(isIntEqualsWord(Interpreter::call0(thread_, test_function), 70));
 }
 
+TEST_F(InterpreterTest, LoadMethodCachedModuleFunction) {
+  EXPECT_FALSE(runFromCStr(runtime_, R"(
+import sys
+
+class C:
+  def getdefaultencoding(self):
+    return "no-utf8"
+
+def test(obj):
+  return obj.getdefaultencoding()
+
+cached = sys.getdefaultencoding
+obj = C()
+)")
+                   .isError());
+  HandleScope scope(thread_);
+  Function test_function(&scope, mainModuleAt(runtime_, "test"));
+  Function expected_value(&scope, mainModuleAt(runtime_, "cached"));
+  MutableBytes bytecode(&scope, test_function.rewrittenBytecode());
+  ASSERT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_ANAMORPHIC);
+  ASSERT_EQ(rewrittenBytecodeOpAt(bytecode, 2), CALL_METHOD);
+
+  // Cache miss.
+  Module sys_module(&scope, runtime_->findModuleById(ID(sys)));
+  MutableTuple caches(&scope, test_function.caches());
+  word cache_index =
+      rewrittenBytecodeCacheAt(bytecode, 1) * kIcPointersPerEntry;
+  Object key(&scope, caches.at(cache_index + kIcEntryKeyOffset));
+  EXPECT_EQ(*key, NoneType::object());
+
+  // Call.
+  EXPECT_TRUE(isStrEqualsCStr(
+      Interpreter::call1(thread_, test_function, sys_module), "utf-8"));
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_MODULE);
+
+  // Cache hit.
+  key = caches.at(cache_index + kIcEntryKeyOffset);
+  EXPECT_TRUE(isIntEqualsWord(*key, sys_module.id()));
+  Object value(&scope, caches.at(cache_index + kIcEntryValueOffset));
+  ASSERT_TRUE(value.isValueCell());
+  EXPECT_EQ(ValueCell::cast(*value).value(), *expected_value);
+
+  // Call.
+  EXPECT_TRUE(isStrEqualsCStr(
+      Interpreter::call1(thread_, test_function, sys_module), "utf-8"));
+
+  // Rewrite.
+  Object obj(&scope, mainModuleAt(runtime_, "obj"));
+  EXPECT_TRUE(isStrEqualsCStr(Interpreter::call1(thread_, test_function, obj),
+                              "no-utf8"));
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_INSTANCE_FUNCTION);
+  key = caches.at(cache_index + kIcEntryKeyOffset);
+  EXPECT_FALSE(key.isValueCell());
+}
+
+TEST_F(InterpreterTest,
+       LoadMethodWithModuleAndNonFunctionRewritesToLoadMethodModule) {
+  EXPECT_FALSE(runFromCStr(runtime_, R"(
+import sys
+
+class C:
+  def __call__(self):
+    return 123
+
+mymodule = type(sys)("mymodule")
+mymodule.getdefaultencoding = C()
+
+def test(obj):
+  return obj.getdefaultencoding()
+)")
+                   .isError());
+  HandleScope scope(thread_);
+  Function test_function(&scope, mainModuleAt(runtime_, "test"));
+  MutableBytes bytecode(&scope, test_function.rewrittenBytecode());
+  Module mymodule(&scope, mainModuleAt(runtime_, "mymodule"));
+  ASSERT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_ANAMORPHIC);
+  ASSERT_EQ(rewrittenBytecodeOpAt(bytecode, 2), CALL_METHOD);
+
+  // Cache miss.
+  MutableTuple caches(&scope, test_function.caches());
+  word cache_index =
+      rewrittenBytecodeCacheAt(bytecode, 1) * kIcPointersPerEntry;
+  Object key(&scope, caches.at(cache_index + kIcEntryKeyOffset));
+  EXPECT_EQ(*key, NoneType::object());
+
+  // Call.
+  EXPECT_TRUE(isIntEqualsWord(
+      Interpreter::call1(thread_, test_function, mymodule), 123));
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_MODULE);
+}
+
+TEST_F(InterpreterTest, LoadMethodModuleGetsEvicted) {
+  EXPECT_FALSE(runFromCStr(runtime_, R"(
+import sys
+
+def test(obj):
+  return obj.getdefaultencoding()
+)")
+                   .isError());
+  HandleScope scope(thread_);
+  Function test_function(&scope, mainModuleAt(runtime_, "test"));
+  MutableBytes bytecode(&scope, test_function.rewrittenBytecode());
+  ASSERT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_ANAMORPHIC);
+  ASSERT_EQ(rewrittenBytecodeOpAt(bytecode, 2), CALL_METHOD);
+
+  // Cache miss.
+  Module sys_module(&scope, runtime_->findModuleById(ID(sys)));
+  MutableTuple caches(&scope, test_function.caches());
+  word cache_index =
+      rewrittenBytecodeCacheAt(bytecode, 1) * kIcPointersPerEntry;
+  Object key(&scope, caches.at(cache_index + kIcEntryKeyOffset));
+  EXPECT_EQ(*key, NoneType::object());
+
+  // Call.
+  EXPECT_TRUE(isStrEqualsCStr(
+      Interpreter::call1(thread_, test_function, sys_module), "utf-8"));
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_MODULE);
+
+  // Update module.
+  Str getdefaultencoding(
+      &scope, runtime_->internStrFromCStr(thread_, "getdefaultencoding"));
+  Object result(&scope,
+                moduleDeleteAttribute(thread_, sys_module, getdefaultencoding));
+  ASSERT_TRUE(result.isNoneType());
+
+  // Cache is empty.
+  key = caches.at(cache_index + kIcEntryKeyOffset);
+  EXPECT_TRUE(key.isNoneType());
+
+  // Cache miss.
+  EXPECT_TRUE(
+      raisedWithStr(Interpreter::call1(thread_, test_function, sys_module),
+                    LayoutId::kAttributeError,
+                    "module 'sys' has no attribute 'getdefaultencoding'"));
+
+  // Bytecode gets rewritten after next call.
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_ANAMORPHIC);
+}
+
+TEST_F(InterpreterTest, LoadMethodModuleWithModuleMismatchUpdatesCache) {
+  EXPECT_FALSE(runFromCStr(runtime_, R"(
+import sys
+
+mymodule = type(sys)("mymodule")
+mymodule.getdefaultencoding = lambda: "hello"
+
+def test(obj):
+  return obj.getdefaultencoding()
+)")
+                   .isError());
+  HandleScope scope(thread_);
+  Function test_function(&scope, mainModuleAt(runtime_, "test"));
+  Module mymodule(&scope, mainModuleAt(runtime_, "mymodule"));
+  MutableBytes bytecode(&scope, test_function.rewrittenBytecode());
+  ASSERT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_ANAMORPHIC);
+  ASSERT_EQ(rewrittenBytecodeOpAt(bytecode, 2), CALL_METHOD);
+
+  // Cache miss.
+  Module sys_module(&scope, runtime_->findModuleById(ID(sys)));
+  MutableTuple caches(&scope, test_function.caches());
+  word cache_index =
+      rewrittenBytecodeCacheAt(bytecode, 1) * kIcPointersPerEntry;
+  Object key(&scope, caches.at(cache_index + kIcEntryKeyOffset));
+  EXPECT_EQ(*key, NoneType::object());
+
+  // Call.
+  EXPECT_TRUE(isStrEqualsCStr(
+      Interpreter::call1(thread_, test_function, sys_module), "utf-8"));
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_MODULE);
+
+  // Cache contains sys.
+  key = caches.at(cache_index + kIcEntryKeyOffset);
+  EXPECT_TRUE(isIntEqualsWord(*key, sys_module.id()));
+
+  // Call.
+  EXPECT_TRUE(isStrEqualsCStr(
+      Interpreter::call1(thread_, test_function, mymodule), "hello"));
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_MODULE);
+
+  // Cache contains mymodule.
+  key = caches.at(cache_index + kIcEntryKeyOffset);
+  EXPECT_TRUE(isIntEqualsWord(*key, mymodule.id()));
+}
+
+TEST_F(InterpreterTest, LoadMethodModuleGetsScannedInOtherEviction) {
+  EXPECT_FALSE(runFromCStr(runtime_, R"(
+import sys
+
+class C:
+  def __init__(self):
+    self.foo = 123
+
+c = C()
+
+def test(obj):
+  c.foo
+  return obj.getdefaultencoding()
+
+def invalidate():
+  C.foo = property(lambda self: 456)
+)")
+                   .isError());
+  HandleScope scope(thread_);
+  Function test_function(&scope, mainModuleAt(runtime_, "test"));
+  Function invalidate(&scope, mainModuleAt(runtime_, "invalidate"));
+  MutableBytes bytecode(&scope, test_function.rewrittenBytecode());
+  ASSERT_EQ(rewrittenBytecodeOpAt(bytecode, 4), LOAD_METHOD_ANAMORPHIC);
+  ASSERT_EQ(rewrittenBytecodeOpAt(bytecode, 5), CALL_METHOD);
+
+  // Cache miss.
+  Module sys_module(&scope, runtime_->findModuleById(ID(sys)));
+  MutableTuple caches(&scope, test_function.caches());
+  word cache_index =
+      rewrittenBytecodeCacheAt(bytecode, 4) * kIcPointersPerEntry;
+  Object key(&scope, caches.at(cache_index + kIcEntryKeyOffset));
+  EXPECT_EQ(*key, NoneType::object());
+
+  // Call.
+  EXPECT_TRUE(isStrEqualsCStr(
+      Interpreter::call1(thread_, test_function, sys_module), "utf-8"));
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 4), LOAD_METHOD_MODULE);
+
+  // Evict the caches in the `test' function.
+  ASSERT_TRUE(Interpreter::call0(thread_, invalidate).isNoneType());
+
+  // The LOAD_METHOD_MODULE is not affected.
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 4), LOAD_METHOD_MODULE);
+  EXPECT_TRUE(isStrEqualsCStr(
+      Interpreter::call1(thread_, test_function, sys_module), "utf-8"));
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 4), LOAD_METHOD_MODULE);
+}
+
+TEST_F(InterpreterTest, LoadMethodTypeCachedModuleFunction) {
+  EXPECT_FALSE(runFromCStr(runtime_, R"(
+class C:
+  def foo(self):
+    return 123
+
+class D:
+  def foo(self):
+    return 456
+
+class E:
+  def foo(self, other):
+    return 789
+
+def test(cls, obj):
+  return cls.foo(obj)
+
+c = C()
+d = D()
+e = E()
+c_cached = C.foo
+d_cached = D.foo
+)")
+                   .isError());
+  HandleScope scope(thread_);
+  Function test_function(&scope, mainModuleAt(runtime_, "test"));
+  Function expected_c(&scope, mainModuleAt(runtime_, "c_cached"));
+  Function expected_d(&scope, mainModuleAt(runtime_, "d_cached"));
+  Type type_c(&scope, mainModuleAt(runtime_, "C"));
+  Object c(&scope, mainModuleAt(runtime_, "c"));
+  Type type_d(&scope, mainModuleAt(runtime_, "D"));
+  Object d(&scope, mainModuleAt(runtime_, "d"));
+  Object e(&scope, mainModuleAt(runtime_, "e"));
+  MutableBytes bytecode(&scope, test_function.rewrittenBytecode());
+  ASSERT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_ANAMORPHIC);
+
+  // Cache miss.
+  MutableTuple caches(&scope, test_function.caches());
+  word cache_index =
+      rewrittenBytecodeCacheAt(bytecode, 1) * kIcPointersPerEntry;
+  Object key(&scope, caches.at(cache_index + kIcEntryKeyOffset));
+  EXPECT_EQ(*key, NoneType::object());
+
+  // Call.
+  EXPECT_TRUE(isIntEqualsWord(
+      Interpreter::call2(thread_, test_function, type_c, c), 123));
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_TYPE);
+
+  // Cached.
+  key = caches.at(cache_index + kIcEntryKeyOffset);
+  EXPECT_TRUE(
+      isIntEqualsWord(*key, static_cast<word>(type_c.instanceLayoutId())));
+  Object value(&scope, caches.at(cache_index + kIcEntryValueOffset));
+  ASSERT_TRUE(value.isValueCell());
+  EXPECT_EQ(ValueCell::cast(*value).value(), *expected_c);
+
+  // Call.
+  EXPECT_TRUE(isIntEqualsWord(
+      Interpreter::call2(thread_, test_function, type_d, d), 456));
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_TYPE);
+
+  // Cache miss and re-cache.
+  key = caches.at(cache_index + kIcEntryKeyOffset);
+  EXPECT_TRUE(
+      isIntEqualsWord(*key, static_cast<word>(type_d.instanceLayoutId())));
+  value = caches.at(cache_index + kIcEntryValueOffset);
+  ASSERT_TRUE(value.isValueCell());
+  EXPECT_EQ(ValueCell::cast(*value).value(), *expected_d);
+
+  // Call and rewrite.
+  Object none(&scope, NoneType::object());
+  EXPECT_TRUE(isIntEqualsWord(
+      Interpreter::call2(thread_, test_function, e, none), 789));
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_INSTANCE_FUNCTION);
+}
+
+TEST_F(InterpreterTest, LoadMethodTypeGetsEvicted) {
+  EXPECT_FALSE(runFromCStr(runtime_, R"(
+import sys
+
+class C:
+  def foo():
+    return 123
+
+def test(cls):
+  return cls.foo()
+
+def invalidate():
+  del C.foo
+)")
+                   .isError());
+  HandleScope scope(thread_);
+  Function test_function(&scope, mainModuleAt(runtime_, "test"));
+  Function invalidate_function(&scope, mainModuleAt(runtime_, "invalidate"));
+  Type type_c(&scope, mainModuleAt(runtime_, "C"));
+  MutableBytes bytecode(&scope, test_function.rewrittenBytecode());
+  ASSERT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_ANAMORPHIC);
+
+  // Cache miss.
+  MutableTuple caches(&scope, test_function.caches());
+  word cache_index =
+      rewrittenBytecodeCacheAt(bytecode, 1) * kIcPointersPerEntry;
+  Object key(&scope, caches.at(cache_index + kIcEntryKeyOffset));
+  EXPECT_EQ(*key, NoneType::object());
+
+  // Call.
+  EXPECT_TRUE(
+      isIntEqualsWord(Interpreter::call1(thread_, test_function, type_c), 123));
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_TYPE);
+
+  // Update type.
+  ASSERT_TRUE(Interpreter::call0(thread_, invalidate_function).isNoneType());
+
+  // Cache is empty.
+  key = caches.at(cache_index + kIcEntryKeyOffset);
+  EXPECT_TRUE(key.isNoneType());
+
+  // Cache miss.
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_TYPE);
+  EXPECT_TRUE(raisedWithStr(Interpreter::call1(thread_, test_function, type_c),
+                            LayoutId::kAttributeError,
+                            "type object 'C' has no attribute 'foo'"));
+
+  // Bytecode gets rewritten after next call.
+  EXPECT_EQ(rewrittenBytecodeOpAt(bytecode, 1), LOAD_METHOD_ANAMORPHIC);
+}
+
 TEST_F(InterpreterTest, LoadMethodCachedDoesNotCacheProperty) {
   HandleScope scope(thread_);
   EXPECT_FALSE(runFromCStr(runtime_, R"(
@@ -8798,6 +9382,7 @@ class C:
 def foo(obj):
   return -obj
 instance = C()
+foo(instance)  # Change UNARY_OP_ANAMORPHIC to UNARY_NEGATIVE
 )")
                    .isError());
   HandleScope scope(thread_);
@@ -8806,6 +9391,60 @@ instance = C()
   Object obj(&scope, mainModuleAt(runtime_, "instance"));
   Object result(&scope, compileAndCallJITFunction1(thread_, function, obj));
   EXPECT_TRUE(isIntEqualsWord(*result, 5));
+}
+
+TEST_F(JitTest, UnaryNegativeSmallIntWithPositiveReturnsNegative) {
+  if (useCppInterpreter()) {
+    GTEST_SKIP();
+  }
+  ASSERT_FALSE(runFromCStr(runtime_, R"(
+def foo(obj):
+  return -obj
+foo(0)  # Change UNARY_OP_ANAMORPHIC to UNARY_NEGATIVE_SMALLINT
+)")
+                   .isError());
+  HandleScope scope(thread_);
+  Function function(&scope, mainModuleAt(runtime_, "foo"));
+  EXPECT_TRUE(containsBytecode(function, UNARY_NEGATIVE_SMALLINT));
+  Object obj(&scope, SmallInt::fromWord(123));
+  Object result(&scope, compileAndCallJITFunction1(thread_, function, obj));
+  EXPECT_TRUE(isIntEqualsWord(*result, -123));
+}
+
+TEST_F(JitTest, UnaryNegativeSmallIntWithNegativeReturnsPositive) {
+  if (useCppInterpreter()) {
+    GTEST_SKIP();
+  }
+  ASSERT_FALSE(runFromCStr(runtime_, R"(
+def foo(obj):
+  return -obj
+foo(0)  # Change UNARY_OP_ANAMORPHIC to UNARY_NEGATIVE_SMALLINT
+)")
+                   .isError());
+  HandleScope scope(thread_);
+  Function function(&scope, mainModuleAt(runtime_, "foo"));
+  EXPECT_TRUE(containsBytecode(function, UNARY_NEGATIVE_SMALLINT));
+  Object obj(&scope, SmallInt::fromWord(-123));
+  Object result(&scope, compileAndCallJITFunction1(thread_, function, obj));
+  EXPECT_TRUE(isIntEqualsWord(*result, 123));
+}
+
+TEST_F(JitTest, UnaryNegativeSmallIntWithZeroReturnsZero) {
+  if (useCppInterpreter()) {
+    GTEST_SKIP();
+  }
+  ASSERT_FALSE(runFromCStr(runtime_, R"(
+def foo(obj):
+  return -obj
+foo(0)  # Change UNARY_OP_ANAMORPHIC to UNARY_NEGATIVE_SMALLINT
+)")
+                   .isError());
+  HandleScope scope(thread_);
+  Function function(&scope, mainModuleAt(runtime_, "foo"));
+  EXPECT_TRUE(containsBytecode(function, UNARY_NEGATIVE_SMALLINT));
+  Object obj(&scope, SmallInt::fromWord(0));
+  Object result(&scope, compileAndCallJITFunction1(thread_, function, obj));
+  EXPECT_TRUE(isIntEqualsWord(*result, 0));
 }
 
 TEST_F(JitTest, UnaryPositiveCallsDunderPos) {

@@ -98,6 +98,11 @@ static RewrittenOp rewriteOperation(const Function& function, BytecodeOp op) {
     return RewrittenOp{INPLACE_OP_ANAMORPHIC, static_cast<int32_t>(bin_op),
                        true};
   };
+  auto cached_unop = [](Interpreter::UnaryOp unary_op) {
+    // TODO(emacs): Add caching for methods on non-smallints
+    return RewrittenOp{UNARY_OP_ANAMORPHIC, static_cast<int32_t>(unary_op),
+                       false};
+  };
   switch (op.bc) {
     case BINARY_ADD:
       return cached_binop(Interpreter::BinaryOp::ADD);
@@ -175,6 +180,9 @@ static RewrittenOp rewriteOperation(const Function& function, BytecodeOp op) {
       return cached_inplace(Interpreter::BinaryOp::TRUEDIV);
     case INPLACE_XOR:
       return cached_inplace(Interpreter::BinaryOp::XOR);
+      // TODO(emacs): Fill in other unary ops
+    case UNARY_NEGATIVE:
+      return cached_unop(Interpreter::UnaryOp::NEGATIVE);
     case LOAD_ATTR:
       return RewrittenOp{LOAD_ATTR_ANAMORPHIC, op.arg, true};
     case LOAD_FAST: {
@@ -263,6 +271,7 @@ static RewrittenOp rewriteOperation(const Function& function, BytecodeOp op) {
     case LOAD_FAST_REVERSE:
     case LOAD_METHOD_ANAMORPHIC:
     case STORE_ATTR_ANAMORPHIC:
+    case UNARY_OP_ANAMORPHIC:
       UNREACHABLE("should not have cached opcode in input");
     default:
       break;
@@ -323,27 +332,6 @@ void rewriteBytecode(Thread* thread, const Function& function) {
   }
   MutableBytes bytecode(&scope, function.rewrittenBytecode());
   word num_opcodes = rewrittenBytecodeLength(bytecode);
-  // Scan bytecode to figure out how many caches we need and if we can use
-  // LOAD_FAST_REVERSE_UNCHECKED.
-  word num_caches = num_global_caches;
-  for (word i = 0; i < num_opcodes;) {
-    BytecodeOp op = nextBytecodeOp(bytecode, &i);
-    RewrittenOp rewritten = rewriteOperation(function, op);
-    if (rewritten.needs_inline_cache) {
-      num_caches++;
-    }
-  }
-  if (num_caches > kMaxCaches) {
-    // Populate global variable caches unconditionally since the interpreter
-    // assumes their existence.
-    if (num_global_caches > 0) {
-      MutableTuple caches(&scope, runtime->newMutableTuple(
-                                      num_global_caches * kIcPointersPerEntry));
-      caches.fill(NoneType::object());
-      function.setCaches(*caches);
-    }
-    return;
-  }
   word cache = num_global_caches;
   bool rewrite_build_slice = false;
   for (word i = 0; i < num_opcodes;) {
@@ -355,22 +343,25 @@ void rewriteBytecode(Thread* thread, const Function& function) {
       if (rewritten.bc == LOAD_SLICE_CACHED) {
         rewrite_build_slice = true;
       }
-      rewrittenBytecodeOpAtPut(bytecode, previous_index, rewritten.bc);
-      rewrittenBytecodeArgAtPut(bytecode, previous_index,
-                                static_cast<byte>(rewritten.arg));
-      rewrittenBytecodeCacheAtPut(bytecode, previous_index, cache);
+      if (cache < kMaxCaches) {
+        rewrittenBytecodeOpAtPut(bytecode, previous_index, rewritten.bc);
+        rewrittenBytecodeArgAtPut(bytecode, previous_index, static_cast<byte>(rewritten.arg));
+        rewrittenBytecodeCacheAtPut(bytecode, previous_index, cache);
 
-      cache++;
-    } else if (rewritten.arg != op.arg || rewritten.bc != op.bc) {
+        cache++;
+      }
+      continue;
+    }
+    if (rewritten.arg != op.arg || rewritten.bc != op.bc) {
       rewrittenBytecodeOpAtPut(bytecode, previous_index, rewritten.bc);
-      rewrittenBytecodeArgAtPut(bytecode, previous_index,
-                                static_cast<byte>(rewritten.arg));
+      rewrittenBytecodeArgAtPut(bytecode, previous_index, static_cast<byte>(rewritten.arg));
     }
   }
-  DCHECK(cache == num_caches, "cache size mismatch");
+  // It may end up exactly equal to kMaxCaches; that's fine because it's a post
+  // increment.
+  DCHECK(cache <= kMaxCaches, "Too many caches: %ld", cache);
   if (cache > 0) {
-    MutableTuple caches(&scope,
-                        runtime->newMutableTuple(cache * kIcPointersPerEntry));
+    MutableTuple caches(&scope, runtime->newMutableTuple(cache * kIcPointersPerEntry));
     caches.fill(NoneType::object());
     function.setCaches(*caches);
 
