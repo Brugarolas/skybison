@@ -89,7 +89,8 @@ struct RewrittenOp {
   bool needs_inline_cache;
 };
 
-static RewrittenOp rewriteOperation(const Function& function, BytecodeOp op) {
+static RewrittenOp rewriteOperation(const Function& function, BytecodeOp op,
+                                    bool is_builtin_module) {
   auto cached_binop = [](Interpreter::BinaryOp bin_op) {
     return RewrittenOp{BINARY_OP_ANAMORPHIC, static_cast<int32_t>(bin_op),
                        true};
@@ -185,6 +186,20 @@ static RewrittenOp rewriteOperation(const Function& function, BytecodeOp op) {
       return cached_unop(Interpreter::UnaryOp::NEGATIVE);
     case LOAD_ATTR:
       return RewrittenOp{LOAD_ATTR_ANAMORPHIC, op.arg, true};
+    case LOAD_GLOBAL: {
+      if (is_builtin_module) {
+        RawTuple names = Tuple::cast(Code::cast(function.code()).names());
+        RawStr name = Str::cast(names.at(op.arg));
+        if (name.equalsCStr("_Unbound")) {
+          DCHECK(Unbound::object() ==
+                     objectFromOparg(opargFromObject(Unbound::object())),
+                 "Expected to be able to fit _Unbound in a byte");
+          return RewrittenOp{LOAD_IMMEDIATE, opargFromObject(Unbound::object()),
+                             false};
+        }
+      }
+      break;
+    }
     case LOAD_FAST: {
       CHECK(op.arg < Code::cast(function.code()).nlocals(),
             "unexpected local number");
@@ -330,14 +345,43 @@ void rewriteBytecode(Thread* thread, const Function& function) {
     }
     return;
   }
+
   MutableBytes bytecode(&scope, function.rewrittenBytecode());
   word num_opcodes = rewrittenBytecodeLength(bytecode);
+
+  // Scan bytecode to figure out how many caches we need and if we can use
+  // LOAD_FAST_REVERSE_UNCHECKED.
+  word num_caches = num_global_caches;
+  for (word i = 0; i < num_opcodes;) {
+    BytecodeOp op = nextBytecodeOp(bytecode, &i);
+    RewrittenOp rewritten = rewriteOperation(function, op,
+                                             /*is_builtin_module=*/false);
+    if (rewritten.needs_inline_cache) {
+      num_caches++;
+    }
+  }
+  if (num_caches > kMaxCaches) {
+    // Populate global variable caches unconditionally since the interpreter
+    // assumes their existence.
+    if (num_global_caches > 0) {
+      MutableTuple caches(&scope, runtime->newMutableTuple(
+                                      num_global_caches * kIcPointersPerEntry));
+      caches.fill(NoneType::object());
+      function.setCaches(*caches);
+    }
+    return;
+  }
+  word cache = num_global_caches;
+  RawObject module = function.moduleObject();
+  bool is_builtin_module = module.isModule() && Module::cast(module).isBuiltin();
+
   word cache = num_global_caches;
   bool rewrite_build_slice = false;
+
   for (word i = 0; i < num_opcodes;) {
     BytecodeOp op = nextBytecodeOp(bytecode, &i);
     word previous_index = i - 1;
-    RewrittenOp rewritten = rewriteOperation(function, op);
+    RewrittenOp rewritten = rewriteOperation(function, op, is_builtin_module);
     if (rewritten.bc == UNUSED_BYTECODE_0) continue;
     if (rewritten.needs_inline_cache) {
       if (rewritten.bc == LOAD_SLICE_CACHED) {
