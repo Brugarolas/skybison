@@ -47,14 +47,30 @@ RawObject getAttribute(Thread* thread, const Object& object,
   return thread->runtime()->attributeAt(thread, object, interned);
 }
 
+static RawObject getAttributeWithDefault(Thread* thread, const Object& object,
+                                         const Object& name) {
+  HandleScope scope(thread);
+  Object interned(&scope, attributeName(thread, name));
+  if (interned.isErrorException()) return *interned;
+  LoadAttrKind kind;
+  Object location(&scope, Unbound::object());
+  return thread->runtime()->attributeAtSetLocation(thread, object, interned,
+                                                   &kind, &location);
+}
+
 RawObject hasAttribute(Thread* thread, const Object& object,
                        const Object& name) {
   HandleScope scope(thread);
   Object interned(&scope, attributeName(thread, name));
   if (interned.isErrorException()) return *interned;
 
-  Object result(&scope,
-                thread->runtime()->attributeAt(thread, object, interned));
+  LoadAttrKind kind;
+  Object location(&scope, Unbound::object());
+  Object result(&scope, thread->runtime()->attributeAtSetLocation(
+                            thread, object, interned, &kind, &location));
+  if (result.isErrorNotFound()) {
+    return Bool::falseObj();
+  }
   if (!result.isErrorException()) {
     return Bool::trueObj();
   }
@@ -447,6 +463,20 @@ static void pickBuiltinTypeCtorFunction(Thread* thread, const Type& type) {
       ctor = moduleAtById(thread, under_builtins, ID(_list_ctor));
       break;
     }
+    case LayoutId::kRange: {
+      // range args are messy. Use __new__ as the default ctor but cache a
+      // specialized version in the interpreter if possible at a given
+      // callsite.
+      ctor = typeAtById(thread, type, ID(__new__));
+      DCHECK(ctor.isStaticMethod(), "expected staticmethod");
+      ctor = StaticMethod::cast(*ctor).function();
+      break;
+    }
+    case LayoutId::kSet: {
+      Module under_builtins(&scope, runtime->findModuleById(ID(_builtins)));
+      ctor = moduleAtById(thread, under_builtins, ID(_set_ctor));
+      break;
+    }
     case LayoutId::kStr: {
       Module under_builtins(&scope, runtime->findModuleById(ID(_builtins)));
       ctor = moduleAtById(thread, under_builtins, ID(_str_ctor));
@@ -775,17 +805,24 @@ RawObject FUNC(builtins, getattr)(Thread* thread, Arguments args) {
   Object self(&scope, args.get(0));
   Object name(&scope, args.get(1));
   Object default_obj(&scope, args.get(2));
-  Object result(&scope, getAttribute(thread, self, name));
-  Runtime* runtime = thread->runtime();
-  if (result.isError() && !default_obj.isUnbound()) {
-    Type given(&scope, thread->pendingExceptionType());
-    Type exc(&scope, runtime->typeAt(LayoutId::kAttributeError));
-    if (givenExceptionMatches(thread, given, exc)) {
-      thread->clearPendingException();
-      result = *default_obj;
+  if (!default_obj.isUnbound()) {
+    Object result(&scope, getAttributeWithDefault(thread, self, name));
+    if (result.isErrorNotFound()) {
+      return *default_obj;
     }
+    if (result.isError()) {
+      Type given(&scope, thread->pendingExceptionType());
+      Runtime* runtime = thread->runtime();
+      Type exc(&scope, runtime->typeAt(LayoutId::kAttributeError));
+      if (givenExceptionMatches(thread, given, exc)) {
+        thread->clearPendingException();
+        return *default_obj;
+      }
+      return *result;
+    }
+    return *result;
   }
-  return *result;
+  return getAttribute(thread, self, name);
 }
 
 RawObject FUNC(builtins, hasattr)(Thread* thread, Arguments args) {

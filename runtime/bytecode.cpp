@@ -25,7 +25,7 @@ BytecodeOp nextBytecodeOp(const MutableBytes& bytecode, word* index) {
   }
   DCHECK(i - *index <= 8, "EXTENDED_ARG-encoded arg must fit in int32_t");
   *index = i;
-  return BytecodeOp{bc, arg, cache};
+  return BytecodeOp{bc, arg, cache, i - 1};
 }
 
 const word kOpcodeOffset = 0;
@@ -98,6 +98,11 @@ static RewrittenOp rewriteOperation(const Function& function, BytecodeOp op,
   auto cached_inplace = [](Interpreter::BinaryOp bin_op) {
     return RewrittenOp{INPLACE_OP_ANAMORPHIC, static_cast<int32_t>(bin_op),
                        true};
+  };
+  auto cached_unop = [](Interpreter::UnaryOp unary_op) {
+    // TODO(emacs): Add caching for methods on non-smallints
+    return RewrittenOp{UNARY_OP_ANAMORPHIC, static_cast<int32_t>(unary_op),
+                       false};
   };
   switch (op.bc) {
     case BINARY_ADD:
@@ -176,6 +181,9 @@ static RewrittenOp rewriteOperation(const Function& function, BytecodeOp op,
       return cached_inplace(Interpreter::BinaryOp::TRUEDIV);
     case INPLACE_XOR:
       return cached_inplace(Interpreter::BinaryOp::XOR);
+      // TODO(emacs): Fill in other unary ops
+    case UNARY_NEGATIVE:
+      return cached_unop(Interpreter::UnaryOp::NEGATIVE);
     case LOAD_ATTR:
       return RewrittenOp{LOAD_ATTR_ANAMORPHIC, op.arg, true};
     case LOAD_GLOBAL: {
@@ -248,6 +256,28 @@ static RewrittenOp rewriteOperation(const Function& function, BytecodeOp op,
         }
       }
     } break;
+    case BUILD_SLICE: {
+      DCHECK(op.arg == 2 || op.arg == 3,
+             "BUILD_SLICE oparg must be 2 or 3; found %d", op.arg);
+      Thread* thread = Thread::current();
+      HandleScope scope(thread);
+      Bytes bytecode(&scope, Code::cast(function.code()).code());
+      if (op.index > 4 &&
+          bytecodeOpAt(bytecode, op.index - 4) == EXTENDED_ARG) {
+        // LOAD_CONST, LOAD_CONST, LOAD_CONST, BUILD_SLICE
+        break;
+      }
+      if (bytecodeOpAt(bytecode, op.index - 2) != LOAD_CONST) {
+        break;
+      }
+      if (bytecodeOpAt(bytecode, op.index - 1) != LOAD_CONST) {
+        break;
+      }
+      if (op.arg == 3 && bytecodeOpAt(bytecode, op.index - 3) != LOAD_CONST) {
+        break;
+      }
+      return RewrittenOp{LOAD_SLICE_CACHED, op.arg, true};
+    }
     case BINARY_OP_ANAMORPHIC:
     case COMPARE_OP_ANAMORPHIC:
     case FOR_ITER_ANAMORPHIC:
@@ -256,6 +286,7 @@ static RewrittenOp rewriteOperation(const Function& function, BytecodeOp op,
     case LOAD_FAST_REVERSE:
     case LOAD_METHOD_ANAMORPHIC:
     case STORE_ATTR_ANAMORPHIC:
+    case UNARY_OP_ANAMORPHIC:
       UNREACHABLE("should not have cached opcode in input");
     default:
       break;
@@ -280,6 +311,21 @@ RawObject expandBytecode(Thread* thread, const Bytes& bytecode) {
 
 static const word kMaxCaches = 65536;
 
+static RawObject constAtOp(const MutableBytes& bytecode, const Tuple& consts,
+                           word index) {
+  Bytecode bc = rewrittenBytecodeOpAt(bytecode, index);
+  switch (bc) {
+    case LOAD_CONST:
+      return consts.at(rewrittenBytecodeArgAt(bytecode, index));
+    case LOAD_BOOL:
+      return Bool::fromBool(rewrittenBytecodeArgAt(bytecode, index));
+    case LOAD_IMMEDIATE:
+      return objectFromOparg(rewrittenBytecodeArgAt(bytecode, index));
+    default:
+      UNIMPLEMENTED("unexpected opcode %s", kBytecodeNames[bc]);
+  }
+}
+
 void rewriteBytecode(Thread* thread, const Function& function) {
   HandleScope scope(thread);
   Runtime* runtime = thread->runtime();
@@ -299,8 +345,10 @@ void rewriteBytecode(Thread* thread, const Function& function) {
     }
     return;
   }
+
   MutableBytes bytecode(&scope, function.rewrittenBytecode());
   word num_opcodes = rewrittenBytecodeLength(bytecode);
+
   // Scan bytecode to figure out how many caches we need and if we can use
   // LOAD_FAST_REVERSE_UNCHECKED.
   word num_caches = num_global_caches;
@@ -325,32 +373,72 @@ void rewriteBytecode(Thread* thread, const Function& function) {
   }
   word cache = num_global_caches;
   RawObject module = function.moduleObject();
-  bool is_builtin_module =
-      module.isModule() && Module::cast(module).isBuiltin();
+  bool is_builtin_module = module.isModule() && Module::cast(module).isBuiltin();
+
+  word cache = num_global_caches;
+  bool rewrite_build_slice = false;
+
   for (word i = 0; i < num_opcodes;) {
     BytecodeOp op = nextBytecodeOp(bytecode, &i);
     word previous_index = i - 1;
     RewrittenOp rewritten = rewriteOperation(function, op, is_builtin_module);
     if (rewritten.bc == UNUSED_BYTECODE_0) continue;
     if (rewritten.needs_inline_cache) {
-      rewrittenBytecodeOpAtPut(bytecode, previous_index, rewritten.bc);
-      rewrittenBytecodeArgAtPut(bytecode, previous_index,
-                                static_cast<byte>(rewritten.arg));
-      rewrittenBytecodeCacheAtPut(bytecode, previous_index, cache);
+      if (rewritten.bc == LOAD_SLICE_CACHED) {
+        rewrite_build_slice = true;
+      }
+      if (cache < kMaxCaches) {
+        rewrittenBytecodeOpAtPut(bytecode, previous_index, rewritten.bc);
+        rewrittenBytecodeArgAtPut(bytecode, previous_index, static_cast<byte>(rewritten.arg));
+        rewrittenBytecodeCacheAtPut(bytecode, previous_index, cache);
 
-      cache++;
-    } else if (rewritten.arg != op.arg || rewritten.bc != op.bc) {
+        cache++;
+      }
+      continue;
+    }
+    if (rewritten.arg != op.arg || rewritten.bc != op.bc) {
       rewrittenBytecodeOpAtPut(bytecode, previous_index, rewritten.bc);
-      rewrittenBytecodeArgAtPut(bytecode, previous_index,
-                                static_cast<byte>(rewritten.arg));
+      rewrittenBytecodeArgAtPut(bytecode, previous_index, static_cast<byte>(rewritten.arg));
     }
   }
-  DCHECK(cache == num_caches, "cache size mismatch");
+  // It may end up exactly equal to kMaxCaches; that's fine because it's a post
+  // increment.
+  DCHECK(cache <= kMaxCaches, "Too many caches: %ld", cache);
   if (cache > 0) {
-    MutableTuple caches(&scope,
-                        runtime->newMutableTuple(cache * kIcPointersPerEntry));
+    MutableTuple caches(&scope, runtime->newMutableTuple(cache * kIcPointersPerEntry));
     caches.fill(NoneType::object());
     function.setCaches(*caches);
+
+    if (rewrite_build_slice) {
+      // Rewrite LOAD_CONSTs before BUILD_SLICE. We need not worry about
+      // EXTENDED_ARG in between because we checked above; we can directly index
+      // backwards.
+      Tuple consts(&scope, Code::cast(function.code()).consts());
+      Object start(&scope, NoneType::object());
+      Object stop(&scope, NoneType::object());
+      Object step(&scope, NoneType::object());
+      Slice slice(&scope, runtime->emptySlice());
+      for (word i = 0; i < num_opcodes;) {
+        BytecodeOp op = nextBytecodeOp(bytecode, &i);
+        if (op.bc == LOAD_SLICE_CACHED) {
+          if (op.arg == 2) {
+            start = constAtOp(bytecode, consts, op.index - 2);
+            stop = constAtOp(bytecode, consts, op.index - 1);
+            step = NoneType::object();
+          } else {
+            start = constAtOp(bytecode, consts, op.index - 3);
+            stop = constAtOp(bytecode, consts, op.index - 2);
+            step = constAtOp(bytecode, consts, op.index - 1);
+            rewrittenBytecodeOpAtPut(bytecode, op.index - 3, NOP);
+          }
+          rewrittenBytecodeOpAtPut(bytecode, op.index - 1, NOP);
+          rewrittenBytecodeOpAtPut(bytecode, op.index - 2, NOP);
+          slice = runtime->newSlice(start, stop, step);
+          word index = op.cache * kIcPointersPerEntry;
+          caches.atPut(index + kIcEntryValueOffset, *slice);
+        }
+      }
+    }
   }
 }
 

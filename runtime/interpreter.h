@@ -67,6 +67,13 @@ class Interpreter {
     OR
   };
 
+  enum class UnaryOp {
+    NEGATIVE,
+    POSITIVE,
+    NOT,
+    INVERT,
+  };
+
   enum class Continue {
     NEXT,
     UNWIND,
@@ -353,6 +360,10 @@ class Interpreter {
   static Continue doBinarySubSmallInt(Thread* thread, word arg);
   static Continue doBinaryOrSmallInt(Thread* thread, word arg);
   static Continue doBinaryOpAnamorphic(Thread* thread, word arg);
+  static Continue doBinaryAddFloat(Thread* thread, word arg);
+  static Continue doBinarySubFloat(Thread* thread, word arg);
+  static Continue doBinaryMulFloat(Thread* thread, word arg);
+  static Continue doBinaryPowerFloat(Thread* thread, word arg);
   static Continue doBinaryOr(Thread* thread, word arg);
   static Continue doBinaryPower(Thread* thread, word arg);
   static Continue doBinaryRshift(Thread* thread, word arg);
@@ -380,6 +391,7 @@ class Interpreter {
   static Continue doCallMethod(Thread* thread, word arg);
   static Continue doCallFunctionAnamorphic(Thread* thread, word arg);
   static Continue doCallFunctionTypeNew(Thread* thread, word arg);
+  static Continue doCallFunctionTypeInit(Thread* thread, word arg);
   static Continue doCompareInAnamorphic(Thread* thread, word arg);
   static Continue doCompareInStr(Thread* thread, word arg);
   static Continue doCompareInTuple(Thread* thread, word arg);
@@ -426,6 +438,7 @@ class Interpreter {
   static Continue doImportName(Thread* thread, word arg);
   static Continue doInplaceAdd(Thread* thread, word arg);
   static Continue doInplaceAddSmallInt(Thread* thread, word arg);
+  static Continue doInplaceAddFloat(Thread* thread, word arg);
   static Continue doInplaceAnd(Thread* thread, word arg);
   static Continue doInplaceFloorDivide(Thread* thread, word arg);
   static Continue doInplaceLshift(Thread* thread, word arg);
@@ -440,6 +453,7 @@ class Interpreter {
   static Continue doInplaceRshift(Thread* thread, word arg);
   static Continue doInplaceSubtract(Thread* thread, word arg);
   static Continue doInplaceSubSmallInt(Thread* thread, word arg);
+  static Continue doInplaceSubFloat(Thread* thread, word arg);
   static Continue doInplaceTrueDivide(Thread* thread, word arg);
   static Continue doInplaceXor(Thread* thread, word arg);
   static Continue doInvalidBytecode(Thread* thread, word arg);
@@ -462,6 +476,8 @@ class Interpreter {
   static Continue doLoadMethod(Thread* thread, word arg);
   static Continue doLoadMethodAnamorphic(Thread* thread, word arg);
   static Continue doLoadMethodInstanceFunction(Thread* thread, word arg);
+  static Continue doLoadMethodModule(Thread* thread, word arg);
+  static Continue doLoadMethodType(Thread* thread, word arg);
   static Continue doLoadMethodPolymorphic(Thread* thread, word arg);
   static Continue doLoadName(Thread* thread, word arg);
   static Continue doLoadType(Thread* thread, word arg);
@@ -484,7 +500,9 @@ class Interpreter {
   static Continue doStoreSubscrPolymorphic(Thread* thread, word arg);
   static Continue doStoreSubscrAnamorphic(Thread* thread, word arg);
   static Continue doUnaryInvert(Thread* thread, word arg);
+  static Continue doUnaryOpAnamorphic(Thread* thread, word arg);
   static Continue doUnaryNegative(Thread* thread, word arg);
+  static Continue doUnaryNegativeSmallInt(Thread* thread, word arg);
   static Continue doUnaryNot(Thread* thread, word arg);
   static Continue doUnaryPositive(Thread* thread, word arg);
   static Continue doUnpackEx(Thread* thread, word arg);
@@ -496,6 +514,7 @@ class Interpreter {
   static Continue doBuildConstKeyMap(Thread* thread, word arg);
   static Continue doBuildList(Thread* thread, word arg);
   static Continue doBuildSlice(Thread* thread, word arg);
+  static Continue doLoadSliceCached(Thread* thread, word arg);
   static Continue doBuildString(Thread* thread, word arg);
   static Continue doBuildTuple(Thread* thread, word arg);
   static Continue doDeleteDeref(Thread* thread, word arg);
@@ -622,6 +641,7 @@ class Interpreter {
                                  word nargs, RawObject* post_call_sp);
 
   static Continue retryLoadAttrCached(Thread* thread, word arg, word cache);
+  static Continue retryLoadMethodCached(Thread* thread, word arg, word cache);
   static Continue loadAttrUpdateCache(Thread* thread, word arg, word cache);
   static Continue storeAttrUpdateCache(Thread* thread, word arg, word cache);
   static Continue storeSubscr(Thread* thread, RawObject set_item_method);

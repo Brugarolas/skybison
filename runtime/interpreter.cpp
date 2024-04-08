@@ -1,6 +1,7 @@
 // Copyright (c) Facebook, Inc. and its affiliates. (http://www.facebook.com)
 #include "interpreter.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -1456,6 +1457,48 @@ HANDLER_INLINE Continue Interpreter::doUnaryPositive(Thread* thread, word) {
   return doUnaryOperation(ID(__pos__), thread);
 }
 
+HANDLER_INLINE
+Continue Interpreter::doUnaryNegativeSmallInt(Thread* thread, word) {
+  RawObject obj = thread->stackPeek(0);
+  if (obj.isSmallInt()) {
+    word value = SmallInt::cast(obj).value();
+    word result_value = -value;
+    if (SmallInt::isValid(result_value)) {
+      thread->stackSetTop(SmallInt::fromWord(result_value));
+      return Continue::NEXT;
+    }
+  }
+  EVENT_CACHE(UNARY_NEGATIVE_SMALLINT);
+  Frame* frame = thread->currentFrame();
+  rewriteCurrentBytecode(frame, UNARY_NEGATIVE);
+  return doUnaryNegative(thread, /*arg=*/0);
+}
+
+HANDLER_INLINE
+Continue Interpreter::doUnaryOpAnamorphic(Thread* thread, word arg) {
+  Frame* frame = thread->currentFrame();
+  if (thread->stackPeek(0).isSmallInt()) {
+    switch (static_cast<UnaryOp>(arg)) {
+      case UnaryOp::NEGATIVE:
+        rewriteCurrentBytecode(frame, UNARY_NEGATIVE_SMALLINT);
+        return doUnaryNegativeSmallInt(thread, arg);
+      default:
+        UNIMPLEMENTED("cached unary operations other than NEGATIVE");
+        break;
+    }
+  }
+  // TODO(emacs): Add caching for methods on non-smallints
+  switch (static_cast<UnaryOp>(arg)) {
+    case UnaryOp::NEGATIVE:
+      rewriteCurrentBytecode(frame, UNARY_NEGATIVE);
+      return doUnaryNegative(thread, /*arg=*/0);
+    default:
+      UNIMPLEMENTED("cached unary operations other than NEGATIVE");
+      break;
+  }
+  UNREACHABLE("all UnaryOp cases should be handled in the switch");
+}
+
 HANDLER_INLINE Continue Interpreter::doUnaryNegative(Thread* thread, word) {
   return doUnaryOperation(ID(__neg__), thread);
 }
@@ -2768,6 +2811,10 @@ HANDLER_INLINE USED RawObject Interpreter::unpackSequence(Thread* thread,
   } else if (iterable.isList()) {
     count = List::cast(iterable).numItems();
     iterable = List::cast(iterable).items();
+  } else if (thread->runtime()->typeOf(iterable).hasFlag(
+                 Type::Flag::kIsStructseq)) {
+    iterable = Tuple::cast(iterable.rawCast<RawUserTupleBase>().value());
+    count = Tuple::cast(iterable).length();
   } else {
     return unpackSequenceIterable(thread, length, iterable);
   }
@@ -3925,6 +3972,8 @@ HANDLER_INLINE Continue Interpreter::doLoadAttrModule(Thread* thread,
       SmallInt::fromWord(receiver.rawCast<RawModule>().id()) == cache_key) {
     RawObject result = caches.at(index + kIcEntryValueOffset);
     DCHECK(result.isValueCell(), "cached value is not a value cell");
+    DCHECK(!ValueCell::cast(result).isPlaceholder(),
+           "attribute has been deleted");
     thread->stackSetTop(ValueCell::cast(result).value());
     return Continue::NEXT;
   }
@@ -3963,6 +4012,8 @@ HANDLER_INLINE Continue Interpreter::doLoadAttrType(Thread* thread, word arg) {
     if (SmallInt::fromWord(id) == layout_id) {
       RawObject result = caches.at(index + kIcEntryValueOffset);
       DCHECK(result.isValueCell(), "cached value is not a value cell");
+      DCHECK(!ValueCell::cast(result).isPlaceholder(),
+             "cached value cell is empty");
       thread->stackSetTop(ValueCell::cast(result).value());
       return Continue::NEXT;
     }
@@ -4534,28 +4585,82 @@ Continue Interpreter::callFunctionTypeNewUpdateCache(Thread* thread, word arg,
   }
   MutableTuple caches(&scope, frame->caches());
   Object ctor(&scope, receiver.ctor());
+  bool set_ctor = false;
+  Runtime* runtime = thread->runtime();
   if (arg == 1) {
-    Runtime* runtime = thread->runtime();
     switch (receiver.instanceLayoutId()) {
       case LayoutId::kStr:
         ctor = runtime->lookupNameInModule(thread, ID(_builtins),
                                            ID(_str_ctor_obj));
         DCHECK(!ctor.isError(), "cannot find _str_ctor_obj");
+        set_ctor = true;
         break;
       case LayoutId::kType:
         ctor =
             runtime->lookupNameInModule(thread, ID(_builtins), ID(_type_ctor));
         DCHECK(!ctor.isError(), "cannot find _type_ctor");
+        set_ctor = true;
         break;
       case LayoutId::kInt:
         ctor = runtime->lookupNameInModule(thread, ID(_builtins),
                                            ID(_int_ctor_obj));
         DCHECK(!ctor.isError(), "cannot find _int_ctor_obj");
+        set_ctor = true;
+        break;
+      case LayoutId::kRange:
+        ctor = runtime->lookupNameInModule(thread, ID(_builtins),
+                                           ID(_range_ctor_stop));
+        DCHECK(!ctor.isError(), "cannot find _range_ctor_stop");
+        set_ctor = true;
+        break;
+      default:
+        break;
+    }
+  } else if (arg == 2) {
+    switch (receiver.instanceLayoutId()) {
+      case LayoutId::kRange:
+        ctor = runtime->lookupNameInModule(thread, ID(_builtins),
+                                           ID(_range_ctor_start_stop));
+        DCHECK(!ctor.isError(), "cannot find _range_ctor_start_stop");
+        set_ctor = true;
+        break;
+      default:
+        break;
+    }
+  } else if (arg == 3) {
+    switch (receiver.instanceLayoutId()) {
+      case LayoutId::kRange:
+        ctor = runtime->lookupNameInModule(thread, ID(_builtins),
+                                           ID(_range_ctor_start_stop_step));
+        DCHECK(!ctor.isError(), "cannot find _range_ctor_start_stop_step");
+        set_ctor = true;
         break;
       default:
         break;
     }
   }
+  if (!set_ctor) {
+    // TODO(emacs): Split out objectInit from objectNew and split opcode into
+    // slots vs no slots
+    // TODO(emacs): Only cache if not abstract (and do not include that in
+    // objectInit)
+    // TODO(emacs): Also split by tuple overflow/no tuple overflow
+    // TODO(emacs): Also cache instanceSize so we can allocate without the
+    // layout object
+    bool use_object_dunder_new =
+        receiver.isType() && receiver.hasFlag(Type::Flag::kHasObjectDunderNew);
+    if (use_object_dunder_new) {
+      // Metaclass is "type" so we do not need to check for __init__ being a
+      // datadescriptor and we can look it up directly on the type.
+      ctor = typeLookupInMroById(thread, *receiver, ID(__init__));
+      DCHECK(!ctor.isError(), "self must have __init__");
+      rewriteCurrentBytecode(frame, CALL_FUNCTION_TYPE_INIT);
+      icUpdateCallFunctionTypeNew(thread, caches, cache, receiver, ctor,
+                                  dependent);
+      return doCallFunctionTypeInit(thread, arg);
+    }
+  }
+  rewriteCurrentBytecode(frame, CALL_FUNCTION_TYPE_NEW);
   icUpdateCallFunctionTypeNew(thread, caches, cache, receiver, ctor, dependent);
   return doCallFunctionTypeNew(thread, arg);
 }
@@ -4590,6 +4695,50 @@ HANDLER_INLINE Continue Interpreter::doCallFunctionTypeNew(Thread* thread,
   thread->stackSetAt(callable_idx, *ctor);
   thread->stackInsertAt(callable_idx, *receiver);
   return tailcallFunction(thread, arg + 1, *ctor);
+}
+
+HANDLER_INLINE Continue Interpreter::doCallFunctionTypeInit(Thread* thread,
+                                                            word arg) {
+  HandleScope scope(thread);
+  Frame* frame = thread->currentFrame();
+  word callable_idx = arg;
+  Object receiver(&scope, thread->stackPeek(callable_idx));
+  if (!receiver.isType()) {
+    EVENT_CACHE(CALL_FUNCTION_TYPE_INIT);
+    rewriteCurrentBytecode(frame, CALL_FUNCTION);
+    return doCallFunction(thread, arg);
+  }
+  MutableTuple caches(&scope, frame->caches());
+  word cache = currentCacheIndex(frame);
+  bool is_found;
+  Object init(&scope, icLookupMonomorphic(
+                          *caches, cache,
+                          Type::cast(*receiver).instanceLayoutId(), &is_found));
+  if (!is_found) {
+    EVENT_CACHE(CALL_FUNCTION_TYPE_INIT);
+    rewriteCurrentBytecode(frame, CALL_FUNCTION);
+    return doCallFunction(thread, arg);
+  }
+  Type type(&scope, *receiver);
+  Object instance(&scope, objectNew(thread, type));
+  DCHECK(init.isFunction(), "cached is expected to be a function");
+  thread->stackSetAt(callable_idx, *init);
+  thread->stackInsertAt(callable_idx, *instance);
+  Object result(&scope, callFunction(thread, arg + 1, *init));
+  // TODO(emacs): When we have real call/ret working in the assembly
+  // interpreter, add an asm implementation of this. Right now it does not make
+  // much sense to do that because the only way to call an entryAsm is to
+  // tailcall it... but we need to do the None check and return the instance.
+  if (!result.isNoneType()) {
+    if (!result.isErrorException()) {
+      Object type_name(&scope, type.name());
+      thread->raiseWithFmt(LayoutId::kTypeError,
+                           "%S.__init__ returned non None", &type_name);
+    }
+    return Continue::UNWIND;
+  }
+  thread->stackPush(*instance);
+  return Continue::NEXT;
 }
 
 HANDLER_INLINE Continue Interpreter::doMakeFunction(Thread* thread, word arg) {
@@ -4635,6 +4784,17 @@ HANDLER_INLINE Continue Interpreter::doBuildSlice(Thread* thread, word arg) {
     Object step_obj(&scope, step);
     thread->stackSetTop(runtime->newSlice(start_obj, stop_obj, step_obj));
   }
+  return Continue::NEXT;
+}
+
+HANDLER_INLINE Continue Interpreter::doLoadSliceCached(Thread* thread, word) {
+  Frame* frame = thread->currentFrame();
+  RawMutableTuple caches = MutableTuple::cast(frame->caches());
+  word cache = currentCacheIndex(frame);
+  word index = cache * kIcPointersPerEntry;
+  RawObject slice = caches.at(index + kIcEntryValueOffset);
+  DCHECK(slice.isSlice(), "expected to have a slice in the cache");
+  thread->stackPush(slice);
   return Continue::NEXT;
 }
 
@@ -5129,7 +5289,8 @@ Continue Interpreter::loadMethodUpdateCache(Thread* thread, word arg,
   Object result(&scope, thread->runtime()->attributeAtSetLocation(
                             thread, receiver, name, &kind, &location));
   if (result.isErrorException()) return Continue::UNWIND;
-  if (kind != LoadAttrKind::kInstanceFunction) {
+  if (kind != LoadAttrKind::kInstanceFunction &&
+      kind != LoadAttrKind::kModule && kind != LoadAttrKind::kType) {
     thread->stackPush(*result);
     thread->stackSetAt(1, Unbound::object());
     return Continue::NEXT;
@@ -5137,21 +5298,54 @@ Continue Interpreter::loadMethodUpdateCache(Thread* thread, word arg,
 
   // Cache the attribute load.
   MutableTuple caches(&scope, frame->caches());
-  ICState next_ic_state = icUpdateAttr(
-      thread, caches, cache, receiver.layoutId(), location, name, dependent);
+  ICState ic_state = icCurrentState(*caches, cache);
 
-  switch (next_ic_state) {
-    case ICState::kMonomorphic:
-      rewriteCurrentBytecode(frame, LOAD_METHOD_INSTANCE_FUNCTION);
-      break;
-    case ICState::kPolymorphic:
-      rewriteCurrentBytecode(frame, LOAD_METHOD_POLYMORPHIC);
-      break;
-    case ICState::kAnamorphic:
-      UNREACHABLE("next_ic_state cannot be anamorphic");
-      break;
+  if (ic_state == ICState::kAnamorphic) {
+    switch (kind) {
+      case LoadAttrKind::kInstanceFunction:
+        rewriteCurrentBytecode(frame, LOAD_METHOD_INSTANCE_FUNCTION);
+        icUpdateAttr(thread, caches, cache, receiver.layoutId(), location, name,
+                     dependent);
+        break;
+      case LoadAttrKind::kModule: {
+        DCHECK(location.isValueCell(), "location must be ValueCell");
+        ValueCell value_cell(&scope, *location);
+        icUpdateMethodModule(thread, caches, cache, receiver, value_cell,
+                             dependent);
+        thread->stackPush(*result);
+        thread->stackSetAt(1, Unbound::object());
+        return Continue::NEXT;
+      }
+      case LoadAttrKind::kType: {
+        DCHECK(location.isValueCell(), "location must be ValueCell");
+        ValueCell value_cell(&scope, *location);
+        icUpdateMethodType(thread, caches, cache, receiver, value_cell,
+                           dependent);
+        thread->stackPush(*result);
+        thread->stackSetAt(1, Unbound::object());
+        return Continue::NEXT;
+      }
+      default:
+        break;
+    }
+  } else {
+    DCHECK(currentBytecode(thread) == LOAD_METHOD_INSTANCE_FUNCTION ||
+               currentBytecode(thread) == LOAD_METHOD_MODULE ||
+               currentBytecode(thread) == LOAD_METHOD_TYPE ||
+               currentBytecode(thread) == LOAD_METHOD_POLYMORPHIC,
+           "unexpected opcode %s", kBytecodeNames[currentBytecode(thread)]);
+    switch (kind) {
+      case LoadAttrKind::kInstanceFunction:
+        rewriteCurrentBytecode(frame, LOAD_METHOD_POLYMORPHIC);
+        icUpdateAttr(thread, caches, cache, receiver.layoutId(), location, name,
+                     dependent);
+        break;
+      default:
+        break;
+    }
   }
-  thread->stackInsertAt(1, *location);
+  thread->stackPush(*result);
+  thread->stackSetAt(1, Unbound::object());
   return Continue::NEXT;
 }
 
@@ -5159,6 +5353,78 @@ HANDLER_INLINE Continue Interpreter::doLoadMethodAnamorphic(Thread* thread,
                                                             word arg) {
   word cache = currentCacheIndex(thread->currentFrame());
   return loadMethodUpdateCache(thread, arg, cache);
+}
+
+// This code cleans-up a monomorphic cache and prepares it for its potential
+// use as a polymorphic cache.  This code should be removed when we change the
+// structure of our caches directly accessible from a function to be monomophic
+// and to allocate the relatively uncommon polymorphic caches in a separate
+// object.
+NEVER_INLINE Continue Interpreter::retryLoadMethodCached(Thread* thread,
+                                                         word arg, word cache) {
+  // Revert the opcode, clear the cache, and retry the attribute lookup.
+  Frame* frame = thread->currentFrame();
+  if (frame->function().isCompiled()) {
+    return Continue::DEOPT;
+  }
+  rewriteCurrentBytecode(frame, LOAD_METHOD_ANAMORPHIC);
+  RawMutableTuple caches = MutableTuple::cast(frame->caches());
+  word index = cache * kIcPointersPerEntry;
+  caches.atPut(index + kIcEntryKeyOffset, NoneType::object());
+  caches.atPut(index + kIcEntryValueOffset, NoneType::object());
+  return Interpreter::loadMethodUpdateCache(thread, arg, cache);
+}
+
+HANDLER_INLINE Continue Interpreter::doLoadMethodModule(Thread* thread,
+                                                        word arg) {
+  Frame* frame = thread->currentFrame();
+  RawObject receiver = thread->stackTop();
+  RawMutableTuple caches = MutableTuple::cast(frame->caches());
+  word cache = currentCacheIndex(frame);
+  word index = cache * kIcPointersPerEntry;
+  RawObject cache_key = caches.at(index + kIcEntryKeyOffset);
+  // isInstanceOfModule() should be just as fast as isModule() in the common
+  // case. If code size or quality is an issue we can adjust this as needed
+  // based on the types that actually flow through here.
+  if (thread->runtime()->isInstanceOfModule(receiver) &&
+      // Use rawCast() to support subclasses without the overhead of a
+      // handle.
+      SmallInt::fromWord(receiver.rawCast<RawModule>().id()) == cache_key) {
+    RawObject result = caches.at(index + kIcEntryValueOffset);
+    DCHECK(result.isValueCell(), "cached value is not a value cell");
+    DCHECK(!ValueCell::cast(result).isPlaceholder(),
+           "attribute has been deleted");
+    thread->stackPush(ValueCell::cast(result).value());
+    thread->stackSetAt(1, Unbound::object());
+    return Continue::NEXT;
+  }
+  EVENT_CACHE(LOAD_METHOD_MODULE);
+  return retryLoadMethodCached(thread, arg, cache);
+}
+
+HANDLER_INLINE Continue Interpreter::doLoadMethodType(Thread* thread,
+                                                      word arg) {
+  Frame* frame = thread->currentFrame();
+  RawObject receiver = thread->stackTop();
+  RawMutableTuple caches = MutableTuple::cast(frame->caches());
+  word cache = currentCacheIndex(frame);
+  word index = cache * kIcPointersPerEntry;
+  RawObject layout_id = caches.at(index + kIcEntryKeyOffset);
+  Runtime* runtime = thread->runtime();
+  if (runtime->isInstanceOfType(receiver)) {
+    word id = static_cast<word>(receiver.rawCast<RawType>().instanceLayoutId());
+    if (SmallInt::fromWord(id) == layout_id) {
+      RawObject result = caches.at(index + kIcEntryValueOffset);
+      DCHECK(result.isValueCell(), "cached value is not a value cell");
+      DCHECK(!ValueCell::cast(result).isPlaceholder(),
+             "cached value cell is empty");
+      thread->stackPush(ValueCell::cast(result).value());
+      thread->stackSetAt(1, Unbound::object());
+      return Continue::NEXT;
+    }
+  }
+  EVENT_CACHE(LOAD_METHOD_TYPE);
+  return retryLoadMethodCached(thread, arg, cache);
 }
 
 HANDLER_INLINE Continue
@@ -5771,6 +6037,23 @@ Continue Interpreter::doInplaceAddSmallInt(Thread* thread, word arg) {
 }
 
 HANDLER_INLINE
+Continue Interpreter::doInplaceAddFloat(Thread* thread, word arg) {
+  RawObject left = thread->stackPeek(1);
+  RawObject right = thread->stackPeek(0);
+  if (left.isFloat() && right.isFloat()) {
+    double left_value = Float::cast(left).value();
+    double right_value = Float::cast(right).value();
+    double result_value = left_value + right_value;
+    thread->stackDrop(1);
+    thread->stackSetTop(thread->runtime()->newFloat(result_value));
+    return Continue::NEXT;
+  }
+  EVENT_CACHE(INPLACE_ADD_FLOAT);
+  word cache = currentCacheIndex(thread->currentFrame());
+  return inplaceOpUpdateCache(thread, arg, cache);
+}
+
+HANDLER_INLINE
 Continue Interpreter::doInplaceSubSmallInt(Thread* thread, word arg) {
   RawObject left = thread->stackPeek(1);
   RawObject right = thread->stackPeek(0);
@@ -5790,6 +6073,23 @@ Continue Interpreter::doInplaceSubSmallInt(Thread* thread, word arg) {
 }
 
 HANDLER_INLINE
+Continue Interpreter::doInplaceSubFloat(Thread* thread, word arg) {
+  RawObject left = thread->stackPeek(1);
+  RawObject right = thread->stackPeek(0);
+  if (left.isFloat() && right.isFloat()) {
+    double left_value = Float::cast(left).value();
+    double right_value = Float::cast(right).value();
+    double result_value = left_value - right_value;
+    thread->stackDrop(1);
+    thread->stackSetTop(thread->runtime()->newFloat(result_value));
+    return Continue::NEXT;
+  }
+  EVENT_CACHE(INPLACE_SUB_FLOAT);
+  word cache = currentCacheIndex(thread->currentFrame());
+  return inplaceOpUpdateCache(thread, arg, cache);
+}
+
+HANDLER_INLINE
 Continue Interpreter::doInplaceOpAnamorphic(Thread* thread, word arg) {
   Frame* frame = thread->currentFrame();
   if (thread->stackPeek(0).isSmallInt() && thread->stackPeek(1).isSmallInt()) {
@@ -5800,6 +6100,20 @@ Continue Interpreter::doInplaceOpAnamorphic(Thread* thread, word arg) {
       case BinaryOp::SUB:
         rewriteCurrentBytecode(frame, INPLACE_SUB_SMALLINT);
         return doInplaceSubSmallInt(thread, arg);
+      default: {
+        word cache = currentCacheIndex(frame);
+        return inplaceOpUpdateCache(thread, arg, cache);
+      }
+    }
+  }
+  if (thread->stackPeek(0).isFloat() && thread->stackPeek(1).isFloat()) {
+    switch (static_cast<BinaryOp>(arg)) {
+      case BinaryOp::ADD:
+        rewriteCurrentBytecode(frame, INPLACE_ADD_FLOAT);
+        return doInplaceAddFloat(thread, arg);
+      case BinaryOp::SUB:
+        rewriteCurrentBytecode(frame, INPLACE_SUB_FLOAT);
+        return doInplaceSubFloat(thread, arg);
       default: {
         word cache = currentCacheIndex(frame);
         return inplaceOpUpdateCache(thread, arg, cache);
@@ -5933,6 +6247,23 @@ Continue Interpreter::doBinaryAddSmallInt(Thread* thread, word arg) {
 }
 
 HANDLER_INLINE
+Continue Interpreter::doBinaryAddFloat(Thread* thread, word arg) {
+  RawObject left = thread->stackPeek(1);
+  RawObject right = thread->stackPeek(0);
+  if (left.isFloat() && right.isFloat()) {
+    double left_value = Float::cast(left).value();
+    double right_value = Float::cast(right).value();
+    double result_value = left_value + right_value;
+    thread->stackDrop(1);
+    thread->stackSetTop(thread->runtime()->newFloat(result_value));
+    return Continue::NEXT;
+  }
+  EVENT_CACHE(BINARY_ADD_FLOAT);
+  word cache = currentCacheIndex(thread->currentFrame());
+  return binaryOpUpdateCache(thread, arg, cache);
+}
+
+HANDLER_INLINE
 Continue Interpreter::doBinaryAndSmallInt(Thread* thread, word arg) {
   RawObject left = thread->stackPeek(1);
   RawObject right = thread->stackPeek(0);
@@ -5965,6 +6296,23 @@ Continue Interpreter::doBinaryMulSmallInt(Thread* thread, word arg) {
     }
   }
   EVENT_CACHE(BINARY_MUL_SMALLINT);
+  word cache = currentCacheIndex(thread->currentFrame());
+  return binaryOpUpdateCache(thread, arg, cache);
+}
+
+HANDLER_INLINE
+Continue Interpreter::doBinaryMulFloat(Thread* thread, word arg) {
+  RawObject left = thread->stackPeek(1);
+  RawObject right = thread->stackPeek(0);
+  if (left.isFloat() && right.isFloat()) {
+    double left_value = Float::cast(left).value();
+    double right_value = Float::cast(right).value();
+    double result_value = left_value * right_value;
+    thread->stackDrop(1);
+    thread->stackSetTop(thread->runtime()->newFloat(result_value));
+    return Continue::NEXT;
+  }
+  EVENT_CACHE(BINARY_MUL_FLOAT);
   word cache = currentCacheIndex(thread->currentFrame());
   return binaryOpUpdateCache(thread, arg, cache);
 }
@@ -6012,6 +6360,23 @@ Continue Interpreter::doBinarySubSmallInt(Thread* thread, word arg) {
 }
 
 HANDLER_INLINE
+Continue Interpreter::doBinarySubFloat(Thread* thread, word arg) {
+  RawObject left = thread->stackPeek(1);
+  RawObject right = thread->stackPeek(0);
+  if (left.isFloat() && right.isFloat()) {
+    double left_value = Float::cast(left).value();
+    double right_value = Float::cast(right).value();
+    double result_value = left_value - right_value;
+    thread->stackDrop(1);
+    thread->stackSetTop(thread->runtime()->newFloat(result_value));
+    return Continue::NEXT;
+  }
+  EVENT_CACHE(BINARY_SUB_FLOAT);
+  word cache = currentCacheIndex(thread->currentFrame());
+  return binaryOpUpdateCache(thread, arg, cache);
+}
+
+HANDLER_INLINE
 Continue Interpreter::doBinaryOrSmallInt(Thread* thread, word arg) {
   RawObject left = thread->stackPeek(1);
   RawObject right = thread->stackPeek(0);
@@ -6025,6 +6390,23 @@ Continue Interpreter::doBinaryOrSmallInt(Thread* thread, word arg) {
     return Continue::NEXT;
   }
   EVENT_CACHE(BINARY_OR_SMALLINT);
+  word cache = currentCacheIndex(thread->currentFrame());
+  return binaryOpUpdateCache(thread, arg, cache);
+}
+
+HANDLER_INLINE
+Continue Interpreter::doBinaryPowerFloat(Thread* thread, word arg) {
+  RawObject left = thread->stackPeek(1);
+  RawObject right = thread->stackPeek(0);
+  if (left.isFloat() && right.isFloat()) {
+    double left_value = Float::cast(left).value();
+    double right_value = Float::cast(right).value();
+    double result_value = std::pow(left_value, right_value);
+    thread->stackDrop(1);
+    thread->stackSetTop(thread->runtime()->newFloat(result_value));
+    return Continue::NEXT;
+  }
+  EVENT_CACHE(BINARY_POWER_FLOAT);
   word cache = currentCacheIndex(thread->currentFrame());
   return binaryOpUpdateCache(thread, arg, cache);
 }
@@ -6052,6 +6434,30 @@ Continue Interpreter::doBinaryOpAnamorphic(Thread* thread, word arg) {
       case BinaryOp::OR:
         rewriteCurrentBytecode(frame, BINARY_OR_SMALLINT);
         return doBinaryOrSmallInt(thread, arg);
+      default: {
+        word cache = currentCacheIndex(frame);
+        return binaryOpUpdateCache(thread, arg, cache);
+      }
+    }
+  }
+  if (thread->stackPeek(0).isFloat() && thread->stackPeek(1).isFloat()) {
+    switch (static_cast<BinaryOp>(arg)) {
+      case BinaryOp::ADD:
+        rewriteCurrentBytecode(frame, BINARY_ADD_FLOAT);
+        return doBinaryAddFloat(thread, arg);
+        break;
+      case BinaryOp::SUB:
+        rewriteCurrentBytecode(frame, BINARY_SUB_FLOAT);
+        return doBinarySubFloat(thread, arg);
+        break;
+      case BinaryOp::MUL:
+        rewriteCurrentBytecode(frame, BINARY_MUL_FLOAT);
+        return doBinaryMulFloat(thread, arg);
+        break;
+      case BinaryOp::POW:
+        rewriteCurrentBytecode(frame, BINARY_POWER_FLOAT);
+        return doBinaryPowerFloat(thread, arg);
+        break;
       default: {
         word cache = currentCacheIndex(frame);
         return binaryOpUpdateCache(thread, arg, cache);

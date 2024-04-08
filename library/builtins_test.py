@@ -4944,6 +4944,32 @@ class ExceptionTests(unittest.TestCase):
         exc = SystemExit(1111)
         self.assertEqual(exc.code, 1111)
 
+    def test_set_name_attr_on_import_error_subclass_with_property_sets_attr(self):
+        class C(ModuleNotFoundError):
+            # Modeled after PackageNotFoundError in
+            # importlib_metadata/__init__.py
+            @property
+            def name(self):
+                (name,) = self.args
+                return name
+
+        c = C("a name")
+        self.assertEqual(c.name, "a name")
+        self.assertEqual(c.path, None)
+
+    def test_set_path_attr_on_import_error_subclass_with_property_sets_attr(self):
+        class C(ModuleNotFoundError):
+            # Modeled after PackageNotFoundError in
+            # importlib_metadata/__init__.py
+            @property
+            def path(self):
+                (path,) = self.args
+                return path
+
+        c = C("a path")
+        self.assertEqual(c.name, None)
+        self.assertEqual(c.path, "a path")
+
 
 class EvalTests(unittest.TestCase):
     def test_globals_none_accesses_function_globals(self):
@@ -6871,6 +6897,30 @@ class InstanceTests(unittest.TestCase):
         # the dict overflow state.
         instance.__dict__ = {"hello": "world"}
         self.assertEqual(list(instance.__dict__.keys()), ["hello"])
+
+    def test_vars_update_with_no_args_does_not_raise(self):
+        class C:
+            pass
+
+        instance = C()
+        vars(instance).update()
+
+    def test_vars_update_with_only_kwargs_sets_attribute(self):
+        class C:
+            pass
+
+        instance = C()
+        vars(instance).update(hello=1)
+        self.assertEqual(instance.hello, 1)
+
+    def test_vars_update_with_args_and_kwargs_sets_attributes(self):
+        class C:
+            pass
+
+        instance = C()
+        vars(instance).update({"hello": 1}, world=2)
+        self.assertEqual(instance.hello, 1)
+        self.assertEqual(instance.world, 2)
 
 
 class IsInstanceTests(unittest.TestCase):

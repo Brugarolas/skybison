@@ -21,17 +21,21 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
+    - name: Update package repos
+      run: sudo apt update
+    - name: Install ninja
+      run: sudo apt install -y ninja-build
+
     - name: Configure CMake
-      # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
-      # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
-      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{matrix.BUILD_TYPE}} -DCMAKE_TOOLCHAIN_FILE=util/linux.cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+      run: |
+        cmake -GNinja -B ${{github.workspace}}/build \
+        -DCMAKE_TOOLCHAIN_FILE=util/linux.cmake \
+        -DCMAKE_BUILD_TYPE=${{matrix.BUILD_TYPE}} \
+        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 
     - name: Build
       working-directory: ${{github.workspace}}/build
-      run: |
-        make -j4
-        make cpython
-        make -j4 cpython-tests
+      run: ninja -j4
 
     - name: Run C++ tests with Skybison
       working-directory: ${{github.workspace}}/build
@@ -41,10 +45,6 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: PYRO_CPP_INTERPRETER=1 ${{github.workspace}}/third-party/gtest-parallel/gtest-parallel ./bin/python-tests
 
-    - name: Run C++ tests with CPython
-      working-directory: ${{github.workspace}}/build
-      run: ${{github.workspace}}/third-party/gtest-parallel/gtest-parallel ./bin/cpython-tests
-
     - name: Run Python tests with Skybison
       working-directory: ${{github.workspace}}
       run: PYRO_BUILD_DIR="build" ./util/python_tests_pyro.sh
@@ -53,10 +53,6 @@ jobs:
       working-directory: ${{github.workspace}}
       run: PYRO_CPP_INTERPRETER=1 PYRO_BUILD_DIR="build" ./util/python_tests_pyro.sh
 
-    - name: Run Python tests with CPython
-      working-directory: ${{github.workspace}}
-      run: PYRO_BUILD_DIR="build" ./util/python_tests_cpython.sh
-
   benchmark:
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-20.04
@@ -64,6 +60,8 @@ jobs:
     - uses: actions/checkout@v3
       with:
         fetch-depth: 2
+    - name: Update package repos
+      run: sudo apt update
     - name: Install tools
       run: sudo apt install -y ninja-build ccache valgrind
     - name: Quickbench
@@ -74,6 +72,9 @@ jobs:
         ${{github.workspace}}/benchmarks/benchmarks/django/setup_django_minimal.sh
         popd
         ./benchmarks/quickbench/diffrevs.py --run-django HEAD^ HEAD | tee django-benchmark-results.json
+    # Hide all previous benchmark comments from GitHub Actions; they are
+    # outdated.
+    - uses: int128/hide-comment-action@v1
     - name: Comment on Pull Request
       uses: actions/github-script@v6
       with:
@@ -115,10 +116,42 @@ jobs:
             body: benchmark_results,
           })
 
+  run-cpython-tests:
+    runs-on: ubuntu-20.04
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Update package repos
+      run: sudo apt update
+    - name: Install ninja
+      run: sudo apt install -y ninja-build
+
+    - name: Configure CMake
+      run: |
+        cmake -GNinja -B ${{github.workspace}}/build \
+        -DCMAKE_TOOLCHAIN_FILE=util/linux.cmake \
+        -DCMAKE_BUILD_TYPE=DebugOpt \
+        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+
+    - name: Build
+      working-directory: ${{github.workspace}}/build
+      run: ninja -j4 cpython cpython-tests
+
+    - name: Run C++ tests with CPython
+      working-directory: ${{github.workspace}}
+      run: ./third-party/gtest-parallel/gtest-parallel ./build/bin/cpython-tests
+
+    - name: Run Python tests with CPython
+      working-directory: ${{github.workspace}}
+      run: PYRO_BUILD_DIR="build" ./util/python_tests_cpython.sh
+
   lint:
     runs-on: ubuntu-20.04
     # TODO(max): Install and run Black on Python code
     steps:
+    - name: Update package repos
+      run: sudo apt update
     - name: Install clang-format
       run: sudo apt install -y clang-format
     - uses: actions/checkout@v3

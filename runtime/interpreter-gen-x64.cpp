@@ -118,7 +118,15 @@ const word kHandlerSizeShift = 8;
 const word kHandlerSize = 1 << kHandlerSizeShift;
 
 const Interpreter::OpcodeHandler kCppHandlers[] = {
+#if DCHECK_IS_ON()
+#define OP(name, id, handler)                                                  \
+  [](Thread* thread, word arg) {                                               \
+    EVENT(InterpreterDeopt_##name);                                            \
+    return Interpreter::handler(thread, arg);                                  \
+  },
+#else
 #define OP(name, id, handler) Interpreter::handler,
+#endif
     FOREACH_BYTECODE(OP)
 #undef OP
 };
@@ -635,8 +643,9 @@ void emitJumpIfNotHasLayoutId(EmitEnv* env, Register r_obj, LayoutId layout_id,
 }
 
 void emitJumpIfNotHeapObjectWithLayoutId(EmitEnv* env, Register r_obj,
-                                         LayoutId layout_id, Label* target) {
-  emitJumpIfImmediate(env, r_obj, target, Assembler::kNearJump);
+                                         LayoutId layout_id, Label* target,
+                                         bool is_near = Assembler::kNearJump) {
+  emitJumpIfImmediate(env, r_obj, target, is_near);
 
   // It is a HeapObject.
   emitJumpIfNotHasLayoutId(env, r_obj, layout_id, target);
@@ -733,6 +742,32 @@ void emitPushBoundMethod(EmitEnv* env, Label* slow_path, Register r_self,
   __ pushq(r_scratch);
 }
 
+// Allocate and push a Float on the stack. If the heap is full and a GC
+// is needed, jump to slow_path instead. r_value will be used to populate the
+// Float. r_space and r_scratch are used as scratch registers.
+//
+// Writes to r_space and r_scratch.
+void emitPushFloat(EmitEnv* env, Label* slow_path, XmmRegister r_value) {
+  ScratchReg r_scratch(env);
+  ScratchReg r_space(env);
+  __ movq(r_space, Address(env->thread, Thread::runtimeOffset()));
+  __ movq(r_space,
+          Address(r_space, Runtime::heapOffset() + Heap::spaceOffset()));
+
+  __ movq(r_scratch, Address(r_space, Space::fillOffset()));
+  __ addq(r_scratch, Immediate(Float::allocationSize()));
+  __ cmpq(r_scratch, Address(r_space, Space::endOffset()));
+  __ jcc(GREATER, slow_path, Assembler::kFarJump);
+  __ xchgq(r_scratch, Address(r_space, Space::fillOffset()));
+  RawHeader header = Header::from(Float::kSize, /*hash=*/0, LayoutId::kFloat,
+                                  ObjectFormat::kData);
+  __ movq(Address(r_scratch, 0), Immediate(header.raw()));
+  __ leaq(r_scratch, Address(r_scratch, -RawFloat::kHeaderOffset +
+                                            Object::kHeapObjectTag));
+  __ movsd(Address(r_scratch, heapObjectDisp(RawFloat::kValueOffset)), r_value);
+  __ pushq(r_scratch);
+}
+
 // Given a RawObject in r_obj and its LayoutId (as a SmallInt) in r_layout_id,
 // load its overflow RawTuple into r_dst.
 //
@@ -792,6 +827,11 @@ void emitAttrWithOffset(EmitEnv* env, void (Assembler::*asm_op)(Address),
 }
 
 template <>
+void emitHandler<NOP>(EmitEnv* env) {
+  emitNextOpcodeFallthrough(env);
+}
+
+template <>
 void emitHandler<BINARY_ADD_SMALLINT>(EmitEnv* env) {
   ScratchReg r_right(env);
   ScratchReg r_left(env);
@@ -822,6 +862,60 @@ void emitHandler<BINARY_ADD_SMALLINT>(EmitEnv* env) {
   emitCall<Interpreter::Continue (*)(Thread*, word, word)>(
       env, Interpreter::binaryOpUpdateCache);
   emitHandleContinue(env, kGenericHandler);
+}
+
+static void emitBinaryOpFloat(EmitEnv* env,
+                              void (Assembler::*asm_op)(XmmRegister left,
+                                                        XmmRegister right)) {
+  ScratchReg r_right(env);
+  ScratchReg r_left(env);
+  Label slow_path;
+
+  __ popq(r_right);
+  __ popq(r_left);
+  emitJumpIfNotHeapObjectWithLayoutId(env, r_left, LayoutId::kFloat, &slow_path,
+                                      Assembler::kFarJump);
+  emitJumpIfNotHeapObjectWithLayoutId(env, r_right, LayoutId::kFloat,
+                                      &slow_path, Assembler::kNearJump);
+  __ movsd(XMM0, Address(r_left, heapObjectDisp(Float::kValueOffset)));
+  __ movsd(XMM1, Address(r_right, heapObjectDisp(Float::kValueOffset)));
+  (env->as.*asm_op)(XMM0, XMM1);
+  emitPushFloat(env, &slow_path, XMM0);
+  emitNextOpcode(env);
+
+  __ bind(&slow_path);
+  __ pushq(r_left);
+  __ pushq(r_right);
+  if (env->in_jit) {
+    emitJumpToDeopt(env);
+    return;
+  }
+  emitJumpToGenericHandler(env);
+}
+
+template <>
+void emitHandler<BINARY_MUL_FLOAT>(EmitEnv* env) {
+  emitBinaryOpFloat(env, &Assembler::mulsd);
+}
+
+template <>
+void emitHandler<BINARY_ADD_FLOAT>(EmitEnv* env) {
+  emitBinaryOpFloat(env, &Assembler::addsd);
+}
+
+template <>
+void emitHandler<INPLACE_ADD_FLOAT>(EmitEnv* env) {
+  emitBinaryOpFloat(env, &Assembler::addsd);
+}
+
+template <>
+void emitHandler<BINARY_SUB_FLOAT>(EmitEnv* env) {
+  emitBinaryOpFloat(env, &Assembler::subsd);
+}
+
+template <>
+void emitHandler<INPLACE_SUB_FLOAT>(EmitEnv* env) {
+  emitBinaryOpFloat(env, &Assembler::subsd);
 }
 
 template <>
@@ -1269,6 +1363,58 @@ void emitHandler<LOAD_TYPE>(EmitEnv* env) {
 }
 
 template <>
+void emitHandler<LOAD_ATTR_INSTANCE_SLOT_DESCR>(EmitEnv* env) {
+  ScratchReg r_base(env);
+  ScratchReg r_layout_id(env);
+  ScratchReg r_offset(env);
+  ScratchReg r_caches(env);
+  ScratchReg r_result(env);
+  Label slow_path;
+  __ popq(r_base);
+  emitGetLayoutId(env, r_layout_id, r_base);
+  __ movq(r_caches, Address(env->frame, Frame::kCachesOffset));
+  emitIcLookupMonomorphic(env, &slow_path, r_offset, r_layout_id, r_caches);
+
+  emitConvertFromSmallInt(env, r_offset);
+  __ movq(r_result, Address(r_base, r_offset, TIMES_1, heapObjectDisp(0)));
+  __ cmpl(r_result, Immediate(Unbound::object().raw()));
+  __ jcc(EQUAL, &slow_path, Assembler::kNearJump);
+  __ pushq(r_result);
+  emitNextOpcode(env);
+
+  __ bind(&slow_path);
+  __ pushq(r_base);
+  if (env->in_jit) {
+    emitJumpToDeopt(env);
+    return;
+  }
+  emitJumpToGenericHandler(env);
+}
+
+template <>
+void emitHandler<LOAD_ATTR_INSTANCE_TYPE>(EmitEnv* env) {
+  ScratchReg r_base(env);
+  ScratchReg r_layout_id(env);
+  ScratchReg r_cached(env);
+  ScratchReg r_caches(env);
+  Label slow_path;
+  __ popq(r_base);
+  emitGetLayoutId(env, r_layout_id, r_base);
+  __ movq(r_caches, Address(env->frame, Frame::kCachesOffset));
+  emitIcLookupMonomorphic(env, &slow_path, r_cached, r_layout_id, r_caches);
+  __ pushq(r_cached);
+  emitNextOpcode(env);
+
+  __ bind(&slow_path);
+  __ pushq(r_base);
+  if (env->in_jit) {
+    emitJumpToDeopt(env);
+    return;
+  }
+  emitJumpToGenericHandler(env);
+}
+
+template <>
 void emitHandler<LOAD_ATTR_INSTANCE_TYPE_BOUND_METHOD>(EmitEnv* env) {
   ScratchReg r_base(env);
   ScratchReg r_scratch(env);
@@ -1448,6 +1594,91 @@ void emitHandler<LOAD_METHOD_INSTANCE_FUNCTION>(EmitEnv* env) {
   // Only functions are cached.
   __ pushq(r_scratch);
   __ pushq(r_base);
+  emitNextOpcode(env);
+
+  __ bind(&slow_path);
+  __ pushq(r_base);
+  if (env->in_jit) {
+    emitJumpToDeopt(env);
+    return;
+  }
+  emitJumpToGenericHandler(env);
+}
+
+static void emitHeaderHashcode(EmitEnv* env, Register r_dst,
+                               Register r_container) {
+  // Load header().hashCode() as a SmallInt
+  // r_dst = header().hashCode()
+  __ movq(r_dst,
+          Address(r_container, heapObjectDisp(RawHeapObject::kHeaderOffset)));
+  __ shrq(r_dst, Immediate(RawHeader::kHashCodeOffset));
+  static_assert(RawHeader::kHashCodeOffset == 32,
+                "expected hash code to occupy top half of qword");
+  static_assert(RawHeader::kHashCodeBits == 32,
+                "expected hash code to occupy top half of qword");
+  __ shlq(r_dst, Immediate(Object::kSmallIntTagBits));
+}
+
+void emitPushImmediate(EmitEnv* env, word value) {
+  if (Utils::fits<int32_t>(value)) {
+    __ pushq(Immediate(value));
+  } else {
+    ScratchReg r_scratch(env);
+
+    __ movq(r_scratch, Immediate(value));
+    __ pushq(r_scratch);
+  }
+}
+
+template <>
+void emitHandler<LOAD_METHOD_MODULE>(EmitEnv* env) {
+  ScratchReg r_base(env);
+  ScratchReg r_module_id(env);
+  ScratchReg r_function(env);
+  ScratchReg r_caches(env);
+  Label slow_path;
+
+  __ popq(r_base);
+  emitJumpIfImmediate(env, r_base, &slow_path, Assembler::kNearJump);
+  emitJumpIfNotHasLayoutId(env, r_base, LayoutId::kModule, &slow_path);
+  __ movq(r_caches, Address(env->frame, Frame::kCachesOffset));
+  // TODO(emacs): Avoid a second header lookup here. I am not sure what a
+  // reasonable API for that would look like.
+  emitHeaderHashcode(env, r_module_id, r_base);
+  emitIcLookupMonomorphic(env, &slow_path, r_function, r_module_id, r_caches);
+  __ movq(r_function,
+          Address(r_function, heapObjectDisp(ValueCell::kValueOffset)));
+  emitPushImmediate(env, Unbound::object().raw());
+  __ pushq(r_function);
+  emitNextOpcode(env);
+
+  __ bind(&slow_path);
+  __ pushq(r_base);
+  if (env->in_jit) {
+    emitJumpToDeopt(env);
+    return;
+  }
+  emitJumpToGenericHandler(env);
+}
+
+template <>
+void emitHandler<LOAD_METHOD_TYPE>(EmitEnv* env) {
+  ScratchReg r_base(env);
+  ScratchReg r_layout_id(env);
+  ScratchReg r_function(env);
+  ScratchReg r_caches(env);
+  Label slow_path;
+
+  __ popq(r_base);
+  emitJumpIfNotHeapObjectWithLayoutId(env, r_base, LayoutId::kType, &slow_path);
+  __ movq(r_layout_id,
+          Address(r_base, heapObjectDisp(Type::kInstanceLayoutIdOffset)));
+  __ movq(r_caches, Address(env->frame, Frame::kCachesOffset));
+  emitIcLookupMonomorphic(env, &slow_path, r_function, r_layout_id, r_caches);
+  __ movq(r_function,
+          Address(r_function, heapObjectDisp(ValueCell::kValueOffset)));
+  emitPushImmediate(env, Unbound::object().raw());
+  __ pushq(r_function);
   emitNextOpcode(env);
 
   __ bind(&slow_path);
@@ -2325,6 +2556,30 @@ void emitHandler<UNARY_NOT>(EmitEnv* env) {
   emitGenericHandler(env, UNARY_NOT);
 }
 
+template <>
+void emitHandler<UNARY_NEGATIVE_SMALLINT>(EmitEnv* env) {
+  Label slow_path;
+  ScratchReg r_obj(env);
+  ScratchReg r_scratch(env);
+
+  // Handle SmallInt directly; fall back to C++ for other types
+  __ popq(r_obj);
+  emitJumpIfNotSmallInt(env, r_obj, &slow_path);
+  __ movq(r_scratch, Immediate(-SmallInt::kMinValue));
+  __ addq(r_scratch, r_obj);
+  __ jcc(SIGN, &slow_path, Assembler::kNearJump);
+  // This little dance is shorter (and probably faster) than converting from a
+  // SmallInt, negating, and converting back to SmallInt.
+  __ andq(r_obj, Immediate(~uint64_t{1}));
+  __ negq(r_obj);
+  __ pushq(r_obj);
+  emitNextOpcode(env);
+
+  __ bind(&slow_path);
+  __ pushq(r_obj);
+  emitGenericHandler(env, UNARY_NEGATIVE_SMALLINT);
+}
+
 static void emitPopJumpIfBool(EmitEnv* env, bool jump_value) {
   ScratchReg r_scratch(env);
   Label jump;
@@ -2422,12 +2677,34 @@ void emitHandler<DUP_TOP>(EmitEnv* env) {
 }
 
 template <>
+void emitHandler<DUP_TOP_TWO>(EmitEnv* env) {
+  __ pushq(Address(RSP, kPointerSize));
+  __ pushq(Address(RSP, kPointerSize));
+  emitNextOpcodeFallthrough(env);
+}
+
+template <>
 void emitHandler<ROT_TWO>(EmitEnv* env) {
   ScratchReg r_scratch(env);
 
   __ popq(r_scratch);
   __ pushq(Address(RSP, 0));
-  __ movq(Address(RSP, 8), r_scratch);
+  __ movq(Address(RSP, kPointerSize), r_scratch);
+  emitNextOpcodeFallthrough(env);
+}
+
+template <>
+void emitHandler<ROT_THREE>(EmitEnv* env) {
+  ScratchReg r_top(env);
+  ScratchReg r_second(env);
+  ScratchReg r_third(env);
+
+  __ popq(r_top);
+  __ popq(r_second);
+  __ popq(r_third);
+  __ pushq(r_top);
+  __ pushq(r_third);
+  __ pushq(r_second);
   emitNextOpcodeFallthrough(env);
 }
 
@@ -2836,17 +3113,6 @@ void jitEmitHandler<CALL_FUNCTION>(JitEnv* env) {
   emitCallTrampoline(env);
 }
 
-void emitPushImmediate(EmitEnv* env, word value) {
-  if (Utils::fits<int32_t>(value)) {
-    __ pushq(Immediate(value));
-  } else {
-    ScratchReg r_scratch(env);
-
-    __ movq(r_scratch, Immediate(value));
-    __ pushq(r_scratch);
-  }
-}
-
 template <>
 void jitEmitHandler<LOAD_BOOL>(JitEnv* env) {
   word arg = env->currentOp().arg;
@@ -3064,6 +3330,7 @@ bool isSupportedInJIT(Bytecode bc) {
     case STORE_SUBSCR_LIST:
     case UNARY_INVERT:
     case UNARY_NEGATIVE:
+    case UNARY_NEGATIVE_SMALLINT:
     case UNARY_NOT:
     case UNARY_POSITIVE:
     case UNPACK_EX:

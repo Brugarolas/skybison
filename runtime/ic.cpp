@@ -85,14 +85,23 @@ ICState icUpdateAttr(Thread* thread, const MutableTuple& caches, word cache,
   }
   RawMutableTuple polymorphic_cache =
       MutableTuple::cast(caches.at(index + kIcEntryValueOffset));
+  bool found = false;
   for (word j = 0; j < kIcPointersPerPolyCache; j += kIcPointersPerEntry) {
     entry_key = polymorphic_cache.at(j + kIcEntryKeyOffset);
     if (entry_key.isNoneType() || entry_key == key) {
       polymorphic_cache.atPut(j + kIcEntryKeyOffset, key);
       polymorphic_cache.atPut(j + kIcEntryValueOffset, *value);
       insertDependencyForTypeLookupInMro(thread, layout_id, name, dependent);
+      found = true;
       break;
     }
+  }
+  if (!found) {
+    // Start over. Empty the cache.
+    polymorphic_cache.fill(NoneType::object());
+    polymorphic_cache.atPut(kIcEntryKeyOffset, key);
+    polymorphic_cache.atPut(kIcEntryValueOffset, *value);
+    insertDependencyForTypeLookupInMro(thread, layout_id, name, dependent);
   }
   return ICState::kPolymorphic;
 }
@@ -117,6 +126,44 @@ void icUpdateAttrModule(Thread* thread, const MutableTuple& caches, word cache,
   DCHECK(bytecode.byteAt(pc) == LOAD_ATTR_ANAMORPHIC,
          "current opcode must be LOAD_ATTR_ANAMORPHIC");
   bytecode.byteAtPut(pc, LOAD_ATTR_MODULE);
+  icInsertDependentToValueCellDependencyLink(thread, dependent, value_cell);
+}
+
+void icUpdateMethodModule(Thread* thread, const MutableTuple& caches,
+                          word cache, const Object& receiver,
+                          const ValueCell& value_cell,
+                          const Function& dependent) {
+  DCHECK(icIsCacheEmpty(caches, cache), "cache must be empty\n");
+  HandleScope scope(thread);
+  word index = cache * kIcPointersPerEntry;
+  Module module(&scope, *receiver);
+  caches.atPut(index + kIcEntryKeyOffset, SmallInt::fromWord(module.id()));
+  caches.atPut(index + kIcEntryValueOffset, *value_cell);
+  RawMutableBytes bytecode =
+      RawMutableBytes::cast(dependent.rewrittenBytecode());
+  word pc = thread->currentFrame()->virtualPC() - kCodeUnitSize;
+  DCHECK(bytecode.byteAt(pc) == LOAD_METHOD_ANAMORPHIC,
+         "current opcode must be LOAD_METHOD_ANAMORPHIC");
+  bytecode.byteAtPut(pc, LOAD_METHOD_MODULE);
+  icInsertDependentToValueCellDependencyLink(thread, dependent, value_cell);
+}
+
+void icUpdateMethodType(Thread* thread, const MutableTuple& caches, word cache,
+                        const Object& receiver, const ValueCell& value_cell,
+                        const Function& dependent) {
+  DCHECK(icIsCacheEmpty(caches, cache), "cache must be empty\n");
+  HandleScope scope(thread);
+  word index = cache * kIcPointersPerEntry;
+  Type type(&scope, *receiver);
+  caches.atPut(index + kIcEntryKeyOffset,
+               SmallInt::fromWord(static_cast<word>(type.instanceLayoutId())));
+  caches.atPut(index + kIcEntryValueOffset, *value_cell);
+  RawMutableBytes bytecode =
+      RawMutableBytes::cast(dependent.rewrittenBytecode());
+  word pc = thread->currentFrame()->virtualPC() - kCodeUnitSize;
+  DCHECK(bytecode.byteAt(pc) == LOAD_METHOD_ANAMORPHIC,
+         "current opcode must be LOAD_METHOD_ANAMORPHIC");
+  bytecode.byteAtPut(pc, LOAD_METHOD_TYPE);
   icInsertDependentToValueCellDependencyLink(thread, dependent, value_cell);
 }
 
@@ -161,11 +208,6 @@ void icUpdateCallFunctionTypeNew(Thread* thread, const MutableTuple& caches,
   word id = static_cast<word>(type.instanceLayoutId());
   caches.atPut(index + kIcEntryKeyOffset, SmallInt::fromWord(id));
   caches.atPut(index + kIcEntryValueOffset, *constructor);
-  MutableBytes bytecode(&scope, dependent.rewrittenBytecode());
-  word pc = thread->currentFrame()->virtualPC() - kCodeUnitSize;
-  DCHECK(bytecode.byteAt(pc) == CALL_FUNCTION_ANAMORPHIC,
-         "current opcode must be CALL_FUNCTION_ANAMORPHIC");
-  bytecode.byteAtPut(pc, CALL_FUNCTION_TYPE_NEW);
   if (!type.isBuiltin()) {
     icInsertConstructorDependencies(thread, static_cast<LayoutId>(id),
                                     dependent);
@@ -727,14 +769,22 @@ ICState icUpdateBinOp(Thread* thread, const MutableTuple& caches, word cache,
   }
   RawMutableTuple polymorphic_cache =
       MutableTuple::cast(caches.at(index + kIcEntryValueOffset));
+  bool found = false;
   for (word j = 0; j < kIcPointersPerPolyCache; j += kIcPointersPerEntry) {
     entry_key = polymorphic_cache.at(j + kIcEntryKeyOffset);
     if (entry_key.isNoneType() ||
         SmallInt::cast(entry_key).value() >> kBitsPerByte == key_high_bits) {
       polymorphic_cache.atPut(j + kIcEntryKeyOffset, new_key);
       polymorphic_cache.atPut(j + kIcEntryValueOffset, *value);
+      found = true;
       break;
     }
+  }
+  if (!found) {
+    // Start over. Empty the cache.
+    polymorphic_cache.fill(NoneType::object());
+    polymorphic_cache.atPut(kIcEntryKeyOffset, new_key);
+    polymorphic_cache.atPut(kIcEntryValueOffset, *value);
   }
   return ICState::kPolymorphic;
 }
@@ -827,6 +877,15 @@ void icInvalidateGlobalVar(Thread* thread, const ValueCell& value_cell) {
           }
           break;
         }
+        case LOAD_METHOD_MODULE: {
+          original_bc = LOAD_METHOD_ANAMORPHIC;
+          word index = op.cache * kIcPointersPerEntry;
+          if (caches.at(index + kIcEntryValueOffset) == *value_cell) {
+            caches.atPut(index + kIcEntryKeyOffset, NoneType::object());
+            caches.atPut(index + kIcEntryValueOffset, NoneType::object());
+          }
+          break;
+        }
         case LOAD_GLOBAL_CACHED:
           original_bc = LOAD_GLOBAL;
           if (op.bc != original_bc && op.arg == name_index_found) {
@@ -859,6 +918,9 @@ bool IcIterator::isAttrNameEqualTo(const Object& attr_name) const {
     case BINARY_SUBSCR_MONOMORPHIC:
     case BINARY_SUBSCR_POLYMORPHIC:
       return attr_name == runtime_->symbols()->at(ID(__getitem__));
+    case CALL_FUNCTION_TYPE_INIT:
+      return attr_name == runtime_->symbols()->at(ID(__new__)) ||
+             attr_name == runtime_->symbols()->at(ID(__init__));
     case CALL_FUNCTION_TYPE_NEW:
       return attr_name == runtime_->symbols()->at(ID(__new__)) ||
              attr_name == runtime_->symbols()->at(ID(__init__));
